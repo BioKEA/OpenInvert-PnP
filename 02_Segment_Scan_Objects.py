@@ -58,6 +58,13 @@ except ModuleNotFoundError as exc:
     raise SystemExit(2) from exc
 
 
+try:
+    from insect_debris_classifier import InsectDebrisClassifier
+except ModuleNotFoundError:
+    InsectDebrisClassifier = None
+
+
+
 MIN_AREA_PX = 80
 MAX_AREA_FRACTION = 0.03
 MAX_RECT_AREA_FRACTION = 0.02
@@ -1306,6 +1313,12 @@ def csv_fields() -> list[str]:
         "absolute_background_contrast",
         "angle_degrees",
         "score",
+        "classifier_enabled",
+        "classifier_class",
+        "insect_probability",
+        "debris_probability",
+        "classifier_threshold",
+        "classifier_would_pick",
     ]
 
 
@@ -1345,6 +1358,8 @@ def process_frame(
     csv_writer: csv.DictWriter,
     all_records: list[dict[str, Any]],
     args: argparse.Namespace,
+    classifier: Any | None = None,
+    rejected_file: Any | None = None,
 ) -> int:
     image_path = scan_dir / frame["file_name"]
     image = cv2.imread(str(image_path))
@@ -1397,6 +1412,49 @@ def process_frame(
             context_file=f"objects/{context_name}",
             overlay_file=overlay_file,
         )
+
+        record["classifier_enabled"] = classifier is not None
+        record["classifier_class"] = ""
+        record["insect_probability"] = None
+        record["debris_probability"] = None
+        record["classifier_threshold"] = None
+        record["classifier_would_pick"] = True
+
+        if classifier is not None:
+            # Intentionally do not catch inference errors here. A classifier
+            # failure must stop segmentation rather than silently passing an
+            # unclassified candidate to the picker.
+            classification = classifier.classify_bgr(crop)
+            record["classifier_class"] = classification["class"]
+            record["insect_probability"] = classification["insect_probability"]
+            record["debris_probability"] = classification["debris_probability"]
+            record["classifier_threshold"] = classification["threshold"]
+            record["classifier_would_pick"] = classification["would_pick"]
+
+            print(
+                f"Candidate {object_index}: "
+                f"{classification['class']} "
+                f"(insect={classification['insect_probability']:.3f}, "
+                f"debris={classification['debris_probability']:.3f}, "
+                f"threshold={classification['threshold']:.2f})",
+                flush=True,
+            )
+
+        if (
+            args.classifier_mode == "filter"
+            and classifier is not None
+            and not bool(record["classifier_would_pick"])
+        ):
+            # Keep rejected candidates for audit/debugging, but never place
+            # them in objects.jsonl/all_records where they could affect
+            # deduplication or become pick targets.
+            if rejected_file is not None:
+                rejected_file.write(json.dumps(record, sort_keys=True) + "\n")
+                rejected_file.flush()
+
+            object_index += 1
+            continue
+
         all_records.append(record)
         frame_records.append(record)
         objects_file.write(json.dumps(record, sort_keys=True) + "\n")
@@ -1548,7 +1606,32 @@ def scan_is_done(scan_dir: Path, processed_frames: int) -> bool:
 
 def run(args: argparse.Namespace) -> None:
     scan_dir = args.scan_dir
+
+    segmentation_complete_path = scan_dir / "segmentation_complete.json"
+    segmentation_failed_path = scan_dir / "segmentation_failed.json"
+    segmentation_complete_path.unlink(missing_ok=True)
+    segmentation_failed_path.unlink(missing_ok=True)
+
     calibration = load_training_tray_calibration(args.training_tray_calibration)
+
+    classifier = None
+    if args.classifier_mode != "off":
+        if args.detector != "bug":
+            raise ValueError(
+                "The insect/debris classifier can only be enabled with --detector bug."
+            )
+        if InsectDebrisClassifier is None:
+            raise RuntimeError(
+                "Classifier support requires insect_debris_classifier.py and "
+                "torch/torchvision/Pillow in the BugPicker Python environment."
+            )
+
+        classifier = InsectDebrisClassifier(
+            model_path=args.classifier_model,
+            architecture=args.classifier_architecture,
+            threshold=args.classifier_threshold,
+            device=args.classifier_device,
+        )
 
     objects_dir = scan_dir / "objects"
     overlays_dir = scan_dir / "overlays"
@@ -1557,6 +1640,7 @@ def run(args: argparse.Namespace) -> None:
 
     objects_path = scan_dir / "objects.jsonl"
     csv_path = scan_dir / "objects.csv"
+    classifier_rejected_path = scan_dir / "classifier_rejected.jsonl"
     object_index = 0
     all_records: list[dict[str, Any]] = []
     processed_keys: set[tuple[int, str]] = set()
@@ -1572,7 +1656,7 @@ def run(args: argparse.Namespace) -> None:
 
     with objects_path.open("w", encoding="utf-8") as objects_file, csv_path.open(
         "w", encoding="utf-8", newline=""
-    ) as csv_file:
+    ) as csv_file, classifier_rejected_path.open("w", encoding="utf-8") as rejected_file:
         csv_writer = csv.DictWriter(csv_file, fieldnames=csv_fields())
         csv_writer.writeheader()
 
@@ -1596,6 +1680,8 @@ def run(args: argparse.Namespace) -> None:
                     csv_writer,
                     all_records,
                     args,
+                    classifier,
+                    rejected_file,
                 )
                 processed_keys.add(key)
 
@@ -1610,13 +1696,18 @@ def run(args: argparse.Namespace) -> None:
 
             time.sleep(args.poll_interval)
 
-    if object_index == 0:
+    if not all_records:
+        message = (
+            "No pickable insect targets remained after classification"
+            if classifier is not None and args.classifier_mode == "filter"
+            else f"No {args.detector} targets detected in this segmentation run"
+        )
         write_detection_status(
             scan_dir,
             "none_found",
             frame_index=max((key[0] for key in processed_keys), default=None),
             preview_file=None,
-            message=f"No {args.detector} targets detected in this segmentation run",
+            message=message,
         )
     unique_object_count = 0
     duplicate_count = 0
@@ -1676,9 +1767,76 @@ def main() -> int:
     )
     parser.add_argument("--watch", action="store_true", help="Process frames as they are appended to manifest.jsonl")
     parser.add_argument("--poll-interval", type=float, default=0.5)
+    parser.add_argument(
+        "--classifier-mode",
+        choices=("off", "annotate", "filter"),
+        default="off",
+        help=(
+            "off: do not run the classifier; "
+            "annotate: classify candidates but keep all; "
+            "filter: reject debris before it can become a pick target."
+        ),
+    )
+    parser.add_argument(
+        "--classifier-model",
+        type=Path,
+        default=PROJECT_ROOT / "models" / "insect_debris_classifier.pt",
+        help="Path to the trained insect/debris .pt checkpoint.",
+    )
+    parser.add_argument(
+        "--classifier-architecture",
+        choices=("efficientnet_b0",),
+        default="efficientnet_b0",
+        help="Architecture used to train the checkpoint.",
+    )
+    parser.add_argument(
+        "--classifier-threshold",
+        type=float,
+        default=0.50,
+        help="Minimum insect probability required to keep a candidate.",
+    )
+    parser.add_argument(
+        "--classifier-device",
+        default="auto",
+        help="Torch device: auto, cpu, cuda, mps, etc.",
+    )
     args = parser.parse_args()
 
-    run(args)
+    try:
+        run(args)
+    except Exception as exc:
+        failure_path = args.scan_dir / "segmentation_failed.json"
+        try:
+            failure_payload = {
+                "status": "failed",
+                "scan_dir": str(args.scan_dir),
+                "detector": args.detector,
+                "classifier_mode": args.classifier_mode,
+                "error": f"{type(exc).__name__}: {exc}",
+                "updated_at": datetime.now().isoformat(),
+            }
+            failure_path.write_text(
+                json.dumps(failure_payload, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            write_detection_status(
+                args.scan_dir,
+                "failed",
+                detector=args.detector,
+                message=f"Segmentation failed: {type(exc).__name__}: {exc}",
+            )
+        except Exception as status_exc:
+            print(
+                f"Also failed to write segmentation failure status: {status_exc}",
+                file=sys.stderr,
+            )
+
+        print(
+            f"Segmentation failed: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        raise
+
     return 0
 
 
