@@ -1105,25 +1105,65 @@ with (imports) {
         var stdoutLog = new File(controlDir, 'segmentation.out.log');
         var stderrLog = new File(controlDir, 'segmentation.err.log');
         var detectorMode = new File(controlDir, 'bug_detector.flag').exists() ? 'bug' : 'resistor';
+        var classifierModel = new File(projectDir, 'models/insect_debris_classifier.pt');
 
         try {
-            var builder = new Packages.java.lang.ProcessBuilder(
-                python,
-                segmentScript,
-                scanDir.getAbsolutePath(),
-                '--detector',
-                detectorMode,
-                '--watch'
-            );
+            var builder;
+            if (detectorMode === 'bug') {
+                if (!classifierModel.exists()) {
+                    throw new Error(
+                        'Bug detector classifier model not found: '
+                        + classifierModel.getAbsolutePath()
+                    );
+                }
+
+                builder = new Packages.java.lang.ProcessBuilder(
+                    python,
+                    segmentScript,
+                    scanDir.getAbsolutePath(),
+                    '--detector',
+                    detectorMode,
+                    '--watch',
+                    '--classifier-mode',
+                    'filter',
+                    '--classifier-model',
+                    classifierModel.getAbsolutePath(),
+                    '--classifier-architecture',
+                    'efficientnet_b0',
+                    '--classifier-threshold',
+                    '0.50'
+                );
+            }
+            else {
+                builder = new Packages.java.lang.ProcessBuilder(
+                    python,
+                    segmentScript,
+                    scanDir.getAbsolutePath(),
+                    '--detector',
+                    detectorMode,
+                    '--watch'
+                );
+            }
+
             builder.directory(projectDir);
             builder.redirectOutput(stdoutLog);
             builder.redirectError(stderrLog);
             builder.start();
-            print('Launched ' + detectorMode + ' segmentation for: ' + scanDir.getAbsolutePath());
+
+            if (detectorMode === 'bug') {
+                print(
+                    'Launched bug segmentation with insect/debris classifier: '
+                    + classifierModel.getAbsolutePath()
+                );
+            }
+            else {
+                print('Launched resistor segmentation for: ' + scanDir.getAbsolutePath());
+            }
         }
         catch (error) {
             print('Failed to launch segmentation: ' + error);
             print('See: ' + stderrLog.getAbsolutePath());
+            throw error;
         }
     }
 
@@ -3198,14 +3238,34 @@ with (imports) {
 
     function waitForSegmentation(scanDir, timeoutMs) {
         var completeFile = new File(scanDir, 'segmentation_complete.json');
+        var failedFile = new File(scanDir, 'segmentation_failed.json');
         var start = new Date().getTime();
+
         while (!completeFile.exists()) {
+            if (failedFile.exists()) {
+                var failureMessage = 'Segmentation failed. See ' + failedFile.getAbsolutePath();
+                try {
+                    var failureRecord = JSON.parse(readText(failedFile));
+                    if (failureRecord.error) {
+                        failureMessage += ': ' + failureRecord.error;
+                    }
+                }
+                catch (failureReadError) {
+                    print('Could not read segmentation failure details: ' + failureReadError);
+                }
+
+                print(failureMessage);
+                return false;
+            }
+
             if ((new Date().getTime() - start) > timeoutMs) {
                 print('Timed out waiting for segmentation: ' + completeFile.getAbsolutePath());
                 return false;
             }
+
             Packages.java.lang.Thread.sleep(500);
         }
+
         return true;
     }
 
