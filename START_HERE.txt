@@ -1,0 +1,10 @@
+Run RUN_BUGPICKER.js from the OpenPnP scripts menu.
+
+The numbered scripts are support tools used by BugPicker:
+00_Halt_Control.py                  pause/resume/halt window
+01_Scan_TopCamera_Rectangle.js      main implementation loaded by RUN_BUGPICKER.js
+02_Segment_Scan_Objects.py          target segmentation
+03_QA_Inspect_Image.py              nozzle and well image QA
+04_Scan_TopCamera_Training_Dataset.js training-data utility
+05_Classify_Review_Targets.py       debris/specimen classifier inference
+06_Retrain_Insect_Debris_Classifier.py offline classifier retraining

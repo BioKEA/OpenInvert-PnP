@@ -80,6 +80,49 @@ def component_stats(mask: np.ndarray) -> dict[str, Any]:
     }
 
 
+def component_count_at_least(mask: np.ndarray, min_area_px: float) -> int:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return sum(1 for contour in contours if float(cv2.contourArea(contour)) >= min_area_px)
+
+
+def largest_component_geometry(mask: np.ndarray, center_x: float, center_y: float) -> dict[str, Any]:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best_contour = None
+    best_area = 0.0
+    for contour in contours:
+        area = float(cv2.contourArea(contour))
+        if area > best_area:
+            best_area = area
+            best_contour = contour
+
+    if best_contour is None or best_area < 20.0:
+        return {
+            "largest_component_width_px": 0,
+            "largest_component_height_px": 0,
+            "largest_component_aspect_ratio": 0.0,
+            "largest_component_fill_ratio": 0.0,
+            "largest_component_centroid_offset_px": 0.0,
+        }
+
+    x, y, width, height = cv2.boundingRect(best_contour)
+    moments = cv2.moments(best_contour)
+    if abs(moments["m00"]) < 0.000001:
+        component_x = x + (width / 2.0)
+        component_y = y + (height / 2.0)
+    else:
+        component_x = moments["m10"] / moments["m00"]
+        component_y = moments["m01"] / moments["m00"]
+    return {
+        "largest_component_width_px": int(width),
+        "largest_component_height_px": int(height),
+        "largest_component_aspect_ratio": float(max(width, height) / max(1, min(width, height))),
+        "largest_component_fill_ratio": float(best_area / float(max(1, width * height))),
+        "largest_component_centroid_offset_px": float(
+            ((component_x - center_x) ** 2 + (component_y - center_y) ** 2) ** 0.5
+        ),
+    }
+
+
 def well_candidate_stats(
     mask: np.ndarray,
     *,
@@ -155,12 +198,36 @@ def inspect_well(image: np.ndarray) -> dict[str, Any]:
     dark_fraction = stats["total_area_px"] / crop_area if crop_area else 0.0
     relative_dark_fraction = relative_stats["total_area_px"] / crop_area if crop_area else 0.0
     outline_fraction = outline_stats["total_area_px"] / crop_area if crop_area else 0.0
+    body_sized_relative = (
+        relative_candidate_stats["relative_largest_candidate_area_px"] >= 4200.0
+        and relative_dark_fraction >= 0.006
+    )
+    large_body_region = relative_stats["largest_area_px"] >= 8000.0 and relative_dark_fraction >= 0.012
+
+    full_hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    hue, saturation, value = cv2.split(full_hsv)
+    height, width = value.shape[:2]
+    yy, xx = np.ogrid[:height, :width]
+    center_x = width / 2.0
+    center_y = height / 2.0
+    well_radius = min(width, height) * 0.50
+    well_roi = ((xx - center_x) ** 2 + (yy - center_y) ** 2) <= (well_radius * well_radius)
+    side_body_mask = (
+        (value < 135)
+        & (saturation > 25)
+        & well_roi
+    ).astype(np.uint8) * 255
+    side_body_mask = cv2.morphologyEx(side_body_mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+    side_body_mask = cv2.morphologyEx(side_body_mask, cv2.MORPH_CLOSE, np.ones((4, 4), np.uint8))
+    side_body_stats = component_stats(side_body_mask)
+    side_body_region = (
+        side_body_stats["largest_area_px"] >= 8500.0
+        and side_body_stats["total_area_px"] >= 9000.0
+    )
     occupied = (
-        relative_dark_fraction >= 0.008
-        or (
-            relative_dark_fraction >= 0.004
-            and relative_candidate_stats["relative_largest_candidate_area_px"] >= 360.0
-        )
+        body_sized_relative
+        or large_body_region
+        or side_body_region
     )
     return {
         "mode": "well",
@@ -173,12 +240,15 @@ def inspect_well(image: np.ndarray) -> dict[str, Any]:
         **candidate_stats,
         **relative_candidate_stats,
         **outline_candidate_stats,
+        "side_body_total_area_px": side_body_stats["total_area_px"],
+        "side_body_largest_area_px": side_body_stats["largest_area_px"],
+        "side_body_component_count": side_body_stats["component_count"],
         **stats,
     }
 
 
 def inspect_nozzle(image: np.ndarray) -> dict[str, Any]:
-    tip_crop, _ = central_crop(image, 0.13)
+    tip_crop, _ = central_crop(image, 0.18)
     tip_hsv = cv2.cvtColor(tip_crop, cv2.COLOR_BGR2HSV)
     tip_gray = cv2.cvtColor(tip_crop, cv2.COLOR_BGR2GRAY)
     hue, saturation, value = cv2.split(tip_hsv)
@@ -224,14 +294,152 @@ def inspect_nozzle(image: np.ndarray) -> dict[str, Any]:
     dark_stats = component_stats(dark_tip_mask)
     colored_stats = component_stats(colored_tip_mask)
     pale_stats = component_stats(pale_tip_mask)
+    colored_large_component_count = component_count_at_least(colored_tip_mask, 900.0)
+    pale_large_component_count = component_count_at_least(pale_tip_mask, 2500.0)
+    pale_geometry = largest_component_geometry(pale_tip_mask, center_x, center_y)
     outline_stats = component_stats(outline_tip_mask)
     tip_area = float(np.count_nonzero(tip_roi))
     dark_fraction = dark_stats["total_area_px"] / tip_area if tip_area else 0.0
+    strong_texture_pickup = (
+        dark_stats["largest_area_px"] >= 800.0
+        or dark_stats["total_area_px"] >= 2500.0
+        or colored_stats["total_area_px"] >= 3000.0
+    )
+    pale_texture_support = (
+        dark_stats["total_area_px"] >= 25.0
+        or colored_stats["total_area_px"] >= 20.0
+    )
+    bare_centered_tip_signature = (
+        pale_large_component_count == 1
+        and dark_stats["total_area_px"] < 25.0
+        and colored_stats["total_area_px"] < 20.0
+        and pale_stats["largest_area_px"] >= 12150.0
+        and pale_stats["total_area_px"] >= 12150.0
+        and pale_stats["total_area_px"] <= 12700.0
+        and pale_geometry["largest_component_width_px"] <= 160
+        and pale_geometry["largest_component_height_px"] >= 132
+        and pale_geometry["largest_component_fill_ratio"] >= 0.580
+        and pale_geometry["largest_component_fill_ratio"] <= 0.665
+        and pale_geometry["largest_component_aspect_ratio"] >= 0.990
+        and pale_geometry["largest_component_aspect_ratio"] <= 1.160
+        and pale_geometry["largest_component_centroid_offset_px"] >= 18.0
+        and pale_geometry["largest_component_centroid_offset_px"] <= 33.0
+    )
+    clean_bare_tip_reject = (
+        bare_centered_tip_signature
+        and (
+            (
+                pale_stats["total_area_px"] >= 12275.0
+                and pale_stats["total_area_px"] <= 12325.0
+                and pale_geometry["largest_component_centroid_offset_px"] >= 28.0
+            )
+            or (
+                pale_stats["total_area_px"] >= 12375.0
+                and pale_stats["total_area_px"] <= 12450.0
+                and pale_geometry["largest_component_centroid_offset_px"] >= 26.0
+            )
+        )
+    )
+    ambiguous_bare_pickup = bare_centered_tip_signature and not clean_bare_tip_reject
+    moderate_texture_pickup = (
+        not bare_centered_tip_signature
+        and dark_stats["total_area_px"] >= 350.0
+        and colored_stats["total_area_px"] >= 100.0
+        and pale_stats["total_area_px"] >= 4500.0
+    )
+    low_pale_texture_pickup = (
+        not bare_centered_tip_signature
+        and (
+            (
+                dark_stats["total_area_px"] >= 750.0
+                and colored_stats["total_area_px"] >= 100.0
+            )
+            or (
+                dark_stats["total_area_px"] >= 175.0
+                and colored_stats["total_area_px"] >= 150.0
+                and pale_stats["total_area_px"] >= 2500.0
+            )
+        )
+    )
+    permissive_texture_pickup = (
+        not bare_centered_tip_signature
+        and (
+            (
+                dark_stats["total_area_px"] >= 75.0
+                and colored_stats["total_area_px"] >= 50.0
+                and pale_stats["total_area_px"] >= 2500.0
+            )
+            or (
+                pale_stats["total_area_px"] >= 7000.0
+                and pale_stats["total_area_px"] <= 9000.0
+                and pale_geometry["largest_component_fill_ratio"] <= 0.45
+            )
+        )
+    )
+    weak_single_channel_pickup = (
+        not bare_centered_tip_signature
+        and (
+            (
+                dark_stats["total_area_px"] >= 20.0
+                and pale_stats["total_area_px"] >= 5500.0
+            )
+            or (
+                dark_stats["total_area_px"] >= 500.0
+                and pale_stats["total_area_px"] >= 2000.0
+            )
+        )
+    )
+    large_pale_pickup = (
+        pale_stats["component_count"] >= 1
+        and pale_stats["largest_area_px"] >= 7000.0
+        and pale_stats["total_area_px"] >= 7000.0
+        and pale_stats["total_area_px"] <= 14000.0
+        and pale_texture_support
+        and not bare_centered_tip_signature
+    )
+    offcenter_pale_pickup = (
+        pale_stats["component_count"] >= 1
+        and pale_stats["largest_area_px"] >= 7000.0
+        and pale_stats["total_area_px"] >= 7000.0
+        and pale_stats["total_area_px"] <= 18000.0
+        and (
+            pale_geometry["largest_component_aspect_ratio"] >= 1.45
+            or pale_geometry["largest_component_centroid_offset_px"] >= radius * 0.35
+            or pale_geometry["largest_component_fill_ratio"] <= 0.50
+        )
+    )
+    low_fill_pale_pickup = (
+        pale_stats["component_count"] >= 1
+        and pale_stats["largest_area_px"] >= 9000.0
+        and pale_stats["total_area_px"] >= 9000.0
+        and pale_stats["total_area_px"] <= 15000.0
+        and pale_geometry["largest_component_fill_ratio"] <= 0.54
+        and pale_geometry["largest_component_centroid_offset_px"] >= radius * 0.20
+        and pale_texture_support
+    )
+    centered_pale_pickup = (
+        pale_large_component_count == 1
+        and pale_stats["largest_area_px"] >= 10000.0
+        and pale_stats["total_area_px"] >= 10000.0
+        and pale_stats["total_area_px"] <= 16500.0
+        and pale_geometry["largest_component_width_px"] >= 120
+        and pale_geometry["largest_component_height_px"] >= 120
+        and pale_geometry["largest_component_fill_ratio"] >= 0.50
+        and pale_geometry["largest_component_centroid_offset_px"] <= radius * 0.40
+        and not bare_centered_tip_signature
+    )
 
     bug_present = (
-        dark_stats["largest_area_px"] >= 80.0
-        or dark_stats["total_area_px"] >= 45.0
-        or colored_stats["total_area_px"] >= 30.0
+        strong_texture_pickup
+        or ambiguous_bare_pickup
+        or moderate_texture_pickup
+        or low_pale_texture_pickup
+        or permissive_texture_pickup
+        or weak_single_channel_pickup
+        or large_pale_pickup
+        or offcenter_pale_pickup
+        or low_fill_pale_pickup
+        or centered_pale_pickup
         or (
             pale_stats["total_area_px"] >= 800.0
             and pale_stats["total_area_px"] <= 2565.0
@@ -249,9 +457,13 @@ def inspect_nozzle(image: np.ndarray) -> dict[str, Any]:
         )
     )
     possible_multiple = (
-        colored_stats["component_count"] >= 8
-        and colored_stats["total_area_px"] >= 1800.0
-        and pale_stats["component_count"] >= 3
+        pale_large_component_count >= 2
+        and pale_stats["total_area_px"] >= 12000.0
+        and (
+            colored_large_component_count >= 2
+            or colored_stats["total_area_px"] >= 4500.0
+            or dark_stats["total_area_px"] >= 3500.0
+        )
     )
     largest_area = max(
         dark_stats["largest_area_px"],
@@ -277,11 +489,31 @@ def inspect_nozzle(image: np.ndarray) -> dict[str, Any]:
         "tip_dark_largest_area_px": dark_stats["largest_area_px"],
         "tip_dark_total_area_px": dark_stats["total_area_px"],
         "tip_colored_component_count": colored_stats["component_count"],
+        "tip_colored_large_component_count": colored_large_component_count,
         "tip_colored_largest_area_px": colored_stats["largest_area_px"],
         "tip_colored_total_area_px": colored_stats["total_area_px"],
         "tip_pale_component_count": pale_stats["component_count"],
+        "tip_pale_large_component_count": pale_large_component_count,
         "tip_pale_largest_area_px": pale_stats["largest_area_px"],
         "tip_pale_total_area_px": pale_stats["total_area_px"],
+        "tip_pale_largest_width_px": pale_geometry["largest_component_width_px"],
+        "tip_pale_largest_height_px": pale_geometry["largest_component_height_px"],
+        "tip_pale_largest_aspect_ratio": pale_geometry["largest_component_aspect_ratio"],
+        "tip_pale_largest_fill_ratio": pale_geometry["largest_component_fill_ratio"],
+        "tip_pale_largest_centroid_offset_px": pale_geometry["largest_component_centroid_offset_px"],
+        "tip_large_pale_pickup": large_pale_pickup,
+        "tip_offcenter_pale_pickup": offcenter_pale_pickup,
+        "tip_low_fill_pale_pickup": low_fill_pale_pickup,
+        "tip_centered_pale_pickup": centered_pale_pickup,
+        "tip_strong_texture_pickup": strong_texture_pickup,
+        "tip_moderate_texture_pickup": moderate_texture_pickup,
+        "tip_low_pale_texture_pickup": low_pale_texture_pickup,
+        "tip_permissive_texture_pickup": permissive_texture_pickup,
+        "tip_weak_single_channel_pickup": weak_single_channel_pickup,
+        "tip_ambiguous_bare_pickup": ambiguous_bare_pickup,
+        "tip_clean_bare_reject": clean_bare_tip_reject,
+        "tip_pale_texture_support": pale_texture_support,
+        "tip_bare_centered_signature": bare_centered_tip_signature,
         "tip_outline_component_count": outline_stats["component_count"],
         "tip_outline_largest_area_px": outline_stats["largest_area_px"],
         "tip_outline_total_area_px": outline_stats["total_area_px"],

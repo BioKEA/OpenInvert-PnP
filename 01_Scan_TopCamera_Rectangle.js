@@ -35,14 +35,25 @@ with (imports) {
         && scriptsRootDir.getParentFile().getName() === 'scripts'
         ? scriptsRootDir.getParentFile().getParentFile()
         : scriptsRootDir.getParentFile();
-    var localPython = new File(projectDir, '.venv/bin/python');
+    var scriptLocalPython = new File(scriptsDir, '.venv/bin/python');
+    var projectLocalPython = new File(projectDir, '.venv/bin/python');
     var previousPython = new File('/home/sean/Documents/OpenInvert-PnP/.venv/bin/python');
-    var python = localPython.exists()
-        ? localPython.getAbsolutePath()
+    var python = scriptLocalPython.exists()
+        ? scriptLocalPython.getAbsolutePath()
+        : projectLocalPython.exists()
+        ? projectLocalPython.getAbsolutePath()
         : previousPython.exists()
         ? previousPython.getAbsolutePath()
         : 'python3';
     var currentCoordinateTransformVersion = 'image_y_inverted_v2';
+    var hiResCameraName = 'OpenPnP Capture Camera HiRes';
+    var hiResFocusCenterZ = -1.3;
+    var hiResFocusFastStepMm = 0.5;
+    var hiResMinimumZ = -3.0;
+    var hiResLightDevice = '';
+    var hiResLightControl = '';
+    var hiResLightOnValue = '1';
+    var hiResLightOffValue = '0';
 
     function pad(number, width) {
         var text = String(number);
@@ -87,7 +98,7 @@ with (imports) {
         return values;
     }
 
-    function jsonLine(frameIndex, fileName, x, y, requestedX, requestedY, width, height, unitsPerPixel) {
+    function jsonLine(frameIndex, fileName, x, y, requestedX, requestedY, width, height, unitsPerPixel, context) {
         var record = {
             frame_index: frameIndex,
             file_name: fileName,
@@ -101,6 +112,13 @@ with (imports) {
             units_per_pixel_x_mm: unitsPerPixel.x,
             units_per_pixel_y_mm: unitsPerPixel.y
         };
+        if (context) {
+            for (var key in context) {
+                if (context.hasOwnProperty(key)) {
+                    record[key] = context[key];
+                }
+            }
+        }
         return JSON.stringify(record) + '\n';
     }
 
@@ -161,6 +179,87 @@ with (imports) {
         }
 
         throw new Error('Camera not found: ' + name);
+    }
+
+    function allCameraNames() {
+        var names = [];
+
+        function addCamera(camera) {
+            if (camera) {
+                names.push(String(camera.getName()));
+            }
+        }
+
+        try {
+            addCamera(machine.defaultHead.defaultCamera);
+        }
+        catch (defaultError) {
+        }
+        try {
+            var headCameras = machine.defaultHead.getCameras();
+            for (var headIndex = 0; headIndex < headCameras.size(); headIndex++) {
+                addCamera(headCameras.get(headIndex));
+            }
+        }
+        catch (headError) {
+        }
+        try {
+            var machineCameras = machine.getCameras();
+            for (var machineIndex = 0; machineIndex < machineCameras.size(); machineIndex++) {
+                addCamera(machineCameras.get(machineIndex));
+            }
+        }
+        catch (machineError) {
+        }
+        return names;
+    }
+
+    function findHiResCamera() {
+        var preferredNames = [
+            hiResCameraName,
+            'OpenPnP Capture Camera HiRes',
+            'OpenPnpCaptureCamera',
+            'OpenPnP Capture Camera',
+            'HiRes'
+        ];
+        for (var i = 0; i < preferredNames.length; i++) {
+            try {
+                var camera = findCameraByName(preferredNames[i]);
+                print('HiRes camera resolved as "' + camera.getName() + '".');
+                return camera;
+            }
+            catch (error) {
+            }
+        }
+
+        var availableNames = allCameraNames();
+        throw new Error('HiRes camera not found. Tried: '
+            + preferredNames.join(', ')
+            + '. Available cameras: '
+            + (availableNames.length === 0 ? '(none found)' : availableNames.join(', ')));
+    }
+
+    function setHiResLight(on) {
+        if (!hiResLightDevice || !hiResLightControl) {
+            return;
+        }
+        var value = on ? hiResLightOnValue : hiResLightOffValue;
+        try {
+            var process = new Packages.java.lang.ProcessBuilder(
+                'v4l2-ctl',
+                '-d',
+                hiResLightDevice,
+                '--set-ctrl=' + hiResLightControl + '=' + value
+            ).start();
+            var exitCode = process.waitFor();
+            if (exitCode !== 0) {
+                print('HiRes light control failed with exit ' + exitCode
+                    + ' for ' + hiResLightControl + '=' + value);
+            }
+        }
+        catch (error) {
+            print('HiRes light control unavailable: ' + error);
+        }
     }
 
     function writeText(file, text) {
@@ -251,6 +350,13 @@ with (imports) {
             yStepMm: 5.0,
             plateA1X: 72.4,
             plateA1Y: 238.6,
+            plateQaCameraA1X: 72.4,
+            plateQaCameraA1Y: 238.6,
+            hiResTrayOffsetX: 0.0,
+            hiResTrayOffsetY: 0.0,
+            hiResFocusZMm: hiResFocusCenterZ,
+            recoveryPlateA1X: 93.0,
+            recoveryPlateA1Y: 287.0,
             plateWellPitchMm: 9.0
         };
     }
@@ -259,6 +365,7 @@ with (imports) {
         var localCalibrationFile = new File(scriptsDir, 'training_tray_calibration.json');
         var controlCalibrationFile = new File(projectDir, 'control/training_tray_calibration.json');
         var calibrationFile = localCalibrationFile.exists() ? localCalibrationFile : controlCalibrationFile;
+        var multiCalibrationFile = multiTrayCalibrationFile();
         var defaultPreset = defaultTrayHeightPreset();
         var calibration = {
             xLeft: defaults.xLeft,
@@ -275,6 +382,13 @@ with (imports) {
             pickZMm: defaultPreset.pickZMm,
             plateA1X: defaults.plateA1X,
             plateA1Y: defaults.plateA1Y,
+            plateQaCameraA1X: defaults.plateQaCameraA1X,
+            plateQaCameraA1Y: defaults.plateQaCameraA1Y,
+            hiResTrayOffsetX: defaults.hiResTrayOffsetX,
+            hiResTrayOffsetY: defaults.hiResTrayOffsetY,
+            hiResFocusZMm: defaults.hiResFocusZMm,
+            recoveryPlateA1X: defaults.recoveryPlateA1X,
+            recoveryPlateA1Y: defaults.recoveryPlateA1Y,
             plateWellPitchMm: defaults.plateWellPitchMm,
             source: 'built-in defaults'
         };
@@ -300,13 +414,250 @@ with (imports) {
         calibration.pickZMm = readNumber(record, 'pick_z_mm', calibration.pickZMm);
         calibration.plateA1X = readNumber(record, 'plate_a1_x_mm', calibration.plateA1X);
         calibration.plateA1Y = readNumber(record, 'plate_a1_y_mm', calibration.plateA1Y);
+        calibration.plateQaCameraA1X = readNumber(record, 'plate_qa_camera_a1_x_mm', calibration.plateA1X);
+        calibration.plateQaCameraA1Y = readNumber(record, 'plate_qa_camera_a1_y_mm', calibration.plateA1Y);
+        calibration.hiResTrayOffsetX = readNumber(record, 'hires_tray_offset_x_mm', calibration.hiResTrayOffsetX);
+        calibration.hiResTrayOffsetY = readNumber(record, 'hires_tray_offset_y_mm', calibration.hiResTrayOffsetY);
+        calibration.hiResFocusZMm = readNumber(record, 'hires_focus_z_mm', calibration.hiResFocusZMm);
+        calibration.recoveryPlateA1X = readNumber(record, 'recovery_plate_a1_x_mm', calibration.recoveryPlateA1X);
+        calibration.recoveryPlateA1Y = readNumber(record, 'recovery_plate_a1_y_mm', calibration.recoveryPlateA1Y);
         calibration.plateWellPitchMm = readNumber(record, 'plate_well_pitch_mm', calibration.plateWellPitchMm);
         calibration.source = calibrationFile.getAbsolutePath();
+        if (multiCalibrationFile.exists()) {
+            var multiRecord = JSON.parse(readText(multiCalibrationFile));
+            calibration.multiConfig = normalizeMultiTrayCalibration(multiRecord, calibration);
+            applyPrimaryMultiSlotToSingleCalibration(calibration, calibration.multiConfig);
+            calibration.source = multiCalibrationFile.getAbsolutePath();
+        }
         return calibration;
     }
 
     function trainingTrayCalibrationFile() {
         return new File(scriptsDir, 'training_tray_calibration.json');
+    }
+
+    function multiTrayCalibrationFile() {
+        return new File(scriptsDir, 'multitray_calibration.json');
+    }
+
+    function clonePlainObject(record) {
+        return JSON.parse(JSON.stringify(record));
+    }
+
+    function multiSlotByNumber(records, slotName, slotNumber) {
+        if (!records) {
+            return null;
+        }
+        for (var i = 0; i < records.length; i++) {
+            if (Number(records[i][slotName]) === Number(slotNumber)) {
+                return records[i];
+            }
+        }
+        return null;
+    }
+
+    function defaultMultiTrayCalibration(singleCalibration) {
+        var base = singleCalibration || loadTrainingTrayCalibration(defaultTrainingTrayCalibrationValues());
+        return {
+            schema_version: 2,
+            active_collection_event_count: 1,
+            active_sorting_tray_count: 1,
+            active_plate_count: 1,
+            active_recovery_plate_count: 1,
+            shared: {
+                camera_x_offset_mm: Number(base.cameraXOffsetMm),
+                camera_y_offset_mm: Number(base.cameraYOffsetMm),
+                scan_bounds_are_camera_coordinates: Boolean(base.scanBoundsAreCameraCoordinates),
+                x_step_mm: Number(base.xStepMm),
+                y_step_mm: Number(base.yStepMm),
+                plate_well_pitch_mm: Number(base.plateWellPitchMm),
+                hires_tray_offset_x_mm: Number(base.hiResTrayOffsetX),
+                hires_tray_offset_y_mm: Number(base.hiResTrayOffsetY),
+                hires_focus_z_mm: Number(base.hiResFocusZMm),
+                debris_classifier_mode: 'train'
+            },
+            collection_events: [
+                { event_slot: 1, enabled: true, collection_code: '', plate_slot: 1, recovery_slot: 1 },
+                { event_slot: 2, enabled: false, collection_code: '', plate_slot: 2, recovery_slot: 2 }
+            ],
+            sorting_trays: [
+                {
+                    tray_slot: 1,
+                    enabled: true,
+                    collection_event_slot: 1,
+                    x_left_mm: Number(base.xLeft),
+                    x_right_mm: Number(base.xRight),
+                    y_top_mm: Number(base.yTop),
+                    y_bottom_mm: Number(base.yBottom),
+                    tray_height_mm: Number(base.trayHeightMm),
+                    size_class: String(base.sizeClass),
+                    pick_z_mm: Number(base.pickZMm)
+                },
+                {
+                    tray_slot: 2,
+                    enabled: false,
+                    collection_event_slot: 1,
+                    x_left_mm: Number(base.xLeft),
+                    x_right_mm: Number(base.xRight),
+                    y_top_mm: Number(base.yTop),
+                    y_bottom_mm: Number(base.yBottom),
+                    tray_height_mm: Number(base.trayHeightMm),
+                    size_class: String(base.sizeClass),
+                    pick_z_mm: Number(base.pickZMm)
+                },
+                {
+                    tray_slot: 3,
+                    enabled: false,
+                    collection_event_slot: 1,
+                    x_left_mm: Number(base.xLeft),
+                    x_right_mm: Number(base.xRight),
+                    y_top_mm: Number(base.yTop),
+                    y_bottom_mm: Number(base.yBottom),
+                    tray_height_mm: Number(base.trayHeightMm),
+                    size_class: String(base.sizeClass),
+                    pick_z_mm: Number(base.pickZMm)
+                },
+                {
+                    tray_slot: 4,
+                    enabled: false,
+                    collection_event_slot: 1,
+                    x_left_mm: Number(base.xLeft),
+                    x_right_mm: Number(base.xRight),
+                    y_top_mm: Number(base.yTop),
+                    y_bottom_mm: Number(base.yBottom),
+                    tray_height_mm: Number(base.trayHeightMm),
+                    size_class: String(base.sizeClass),
+                    pick_z_mm: Number(base.pickZMm)
+                }
+            ],
+            plates: [
+                {
+                    plate_slot: 1,
+                    enabled: true,
+                    plate_number: 'AA0001',
+                    start_well: 'A1',
+                    plate_a1_x_mm: Number(base.plateA1X),
+                    plate_a1_y_mm: Number(base.plateA1Y),
+                    plate_qa_camera_a1_x_mm: Number(base.plateQaCameraA1X),
+                    plate_qa_camera_a1_y_mm: Number(base.plateQaCameraA1Y)
+                },
+                {
+                    plate_slot: 2,
+                    enabled: false,
+                    plate_number: 'AA0002',
+                    start_well: 'A1',
+                    plate_a1_x_mm: Number(base.plateA1X),
+                    plate_a1_y_mm: Number(base.plateA1Y),
+                    plate_qa_camera_a1_x_mm: Number(base.plateQaCameraA1X),
+                    plate_qa_camera_a1_y_mm: Number(base.plateQaCameraA1Y)
+                }
+            ],
+            recovery_plates: [
+                {
+                    recovery_slot: 1,
+                    enabled: true,
+                    recovery_plate_a1_x_mm: Number(base.recoveryPlateA1X),
+                    recovery_plate_a1_y_mm: Number(base.recoveryPlateA1Y)
+                },
+                {
+                    recovery_slot: 2,
+                    enabled: false,
+                    recovery_plate_a1_x_mm: Number(base.recoveryPlateA1X),
+                    recovery_plate_a1_y_mm: Number(base.recoveryPlateA1Y)
+                }
+            ]
+        };
+    }
+
+    function normalizeMultiTrayCalibration(record, singleCalibration) {
+        var normalized = defaultMultiTrayCalibration(singleCalibration);
+        if (!record) {
+            return normalized;
+        }
+        normalized.schema_version = 2;
+        normalized.active_collection_event_count = Math.max(1, Math.min(2, Number(record.active_collection_event_count || 1)));
+        normalized.active_sorting_tray_count = Math.max(1, Math.min(4, Number(record.active_sorting_tray_count || 1)));
+        normalized.active_plate_count = Math.max(1, Math.min(2, Number(record.active_plate_count || normalized.active_collection_event_count)));
+        normalized.active_recovery_plate_count = Math.max(1, Math.min(2, Number(record.active_recovery_plate_count || normalized.active_collection_event_count)));
+        if (record.shared) {
+            normalized.shared.camera_x_offset_mm = readNumber(record.shared, 'camera_x_offset_mm', normalized.shared.camera_x_offset_mm);
+            normalized.shared.camera_y_offset_mm = readNumber(record.shared, 'camera_y_offset_mm', normalized.shared.camera_y_offset_mm);
+            normalized.shared.scan_bounds_are_camera_coordinates = record.shared.scan_bounds_are_camera_coordinates === undefined
+                ? normalized.shared.scan_bounds_are_camera_coordinates
+                : Boolean(record.shared.scan_bounds_are_camera_coordinates);
+            normalized.shared.x_step_mm = readNumber(record.shared, 'x_step_mm', normalized.shared.x_step_mm);
+            normalized.shared.y_step_mm = readNumber(record.shared, 'y_step_mm', normalized.shared.y_step_mm);
+            normalized.shared.plate_well_pitch_mm = readNumber(record.shared, 'plate_well_pitch_mm', normalized.shared.plate_well_pitch_mm);
+            normalized.shared.hires_tray_offset_x_mm = readNumber(record.shared, 'hires_tray_offset_x_mm', normalized.shared.hires_tray_offset_x_mm);
+            normalized.shared.hires_tray_offset_y_mm = readNumber(record.shared, 'hires_tray_offset_y_mm', normalized.shared.hires_tray_offset_y_mm);
+            normalized.shared.hires_focus_z_mm = readNumber(record.shared, 'hires_focus_z_mm', normalized.shared.hires_focus_z_mm);
+            normalized.shared.debris_classifier_mode = String(record.shared.debris_classifier_mode || normalized.shared.debris_classifier_mode);
+            if (normalized.shared.debris_classifier_mode !== 'auto') {
+                normalized.shared.debris_classifier_mode = 'train';
+            }
+        }
+
+        function mergeSlots(targetRecords, sourceRecords, slotName) {
+            if (!sourceRecords) {
+                return;
+            }
+            for (var i = 0; i < targetRecords.length; i++) {
+                var source = multiSlotByNumber(sourceRecords, slotName, targetRecords[i][slotName]);
+                if (source) {
+                    for (var key in source) {
+                        if (source.hasOwnProperty(key)) {
+                            targetRecords[i][key] = source[key];
+                        }
+                    }
+                }
+            }
+        }
+
+        mergeSlots(normalized.collection_events, record.collection_events, 'event_slot');
+        mergeSlots(normalized.sorting_trays, record.sorting_trays, 'tray_slot');
+        mergeSlots(normalized.plates, record.plates, 'plate_slot');
+        mergeSlots(normalized.recovery_plates, record.recovery_plates, 'recovery_slot');
+        return normalized;
+    }
+
+    function applyPrimaryMultiSlotToSingleCalibration(calibration, multiConfig) {
+        var tray = multiSlotByNumber(multiConfig.sorting_trays, 'tray_slot', 1);
+        var plate = multiSlotByNumber(multiConfig.plates, 'plate_slot', 1);
+        var recovery = multiSlotByNumber(multiConfig.recovery_plates, 'recovery_slot', 1);
+        calibration.cameraXOffsetMm = Number(multiConfig.shared.camera_x_offset_mm);
+        calibration.cameraYOffsetMm = Number(multiConfig.shared.camera_y_offset_mm);
+        calibration.scanBoundsAreCameraCoordinates = Boolean(multiConfig.shared.scan_bounds_are_camera_coordinates);
+        calibration.xStepMm = Number(multiConfig.shared.x_step_mm);
+        calibration.yStepMm = Number(multiConfig.shared.y_step_mm);
+        calibration.plateWellPitchMm = Number(multiConfig.shared.plate_well_pitch_mm);
+        calibration.hiResTrayOffsetX = isNaN(Number(multiConfig.shared.hires_tray_offset_x_mm))
+            ? 0.0
+            : Number(multiConfig.shared.hires_tray_offset_x_mm);
+        calibration.hiResTrayOffsetY = isNaN(Number(multiConfig.shared.hires_tray_offset_y_mm))
+            ? 0.0
+            : Number(multiConfig.shared.hires_tray_offset_y_mm);
+        calibration.hiResFocusZMm = isNaN(Number(multiConfig.shared.hires_focus_z_mm))
+            ? hiResFocusCenterZ
+            : Number(multiConfig.shared.hires_focus_z_mm);
+        if (tray) {
+            calibration.xLeft = Number(tray.x_left_mm);
+            calibration.xRight = Number(tray.x_right_mm);
+            calibration.yTop = Number(tray.y_top_mm);
+            calibration.yBottom = Number(tray.y_bottom_mm);
+            calibration.trayHeightMm = Number(tray.tray_height_mm);
+            calibration.sizeClass = String(tray.size_class);
+            calibration.pickZMm = Number(tray.pick_z_mm);
+        }
+        if (plate) {
+            calibration.plateA1X = Number(plate.plate_a1_x_mm);
+            calibration.plateA1Y = Number(plate.plate_a1_y_mm);
+            calibration.plateQaCameraA1X = Number(plate.plate_qa_camera_a1_x_mm);
+            calibration.plateQaCameraA1Y = Number(plate.plate_qa_camera_a1_y_mm);
+        }
+        if (recovery) {
+            calibration.recoveryPlateA1X = Number(recovery.recovery_plate_a1_x_mm);
+            calibration.recoveryPlateA1Y = Number(recovery.recovery_plate_a1_y_mm);
+        }
     }
 
     function writeTrainingTrayCalibration(calibration) {
@@ -325,10 +676,21 @@ with (imports) {
             pick_z_mm: calibration.pickZMm,
             plate_a1_x_mm: calibration.plateA1X,
             plate_a1_y_mm: calibration.plateA1Y,
+            plate_qa_camera_a1_x_mm: calibration.plateQaCameraA1X,
+            plate_qa_camera_a1_y_mm: calibration.plateQaCameraA1Y,
+            hires_tray_offset_x_mm: calibration.hiResTrayOffsetX,
+            hires_tray_offset_y_mm: calibration.hiResTrayOffsetY,
+            hires_focus_z_mm: calibration.hiResFocusZMm,
+            recovery_plate_a1_x_mm: calibration.recoveryPlateA1X,
+            recovery_plate_a1_y_mm: calibration.recoveryPlateA1Y,
             plate_well_pitch_mm: calibration.plateWellPitchMm
         };
         var file = trainingTrayCalibrationFile();
         writeText(file, JSON.stringify(record, null, 2) + '\n');
+        if (calibration.multiConfig) {
+            writeText(multiTrayCalibrationFile(), JSON.stringify(calibration.multiConfig, null, 2) + '\n');
+            print('Saved multi-tray calibration: ' + multiTrayCalibrationFile().getAbsolutePath());
+        }
         calibration.source = file.getAbsolutePath();
         print('Saved training tray calibration: ' + calibration.source);
     }
@@ -339,6 +701,335 @@ with (imports) {
             throw new Error(name + ' must be a number.');
         }
         return value;
+    }
+
+    function selectedOneBasedIndex(comboBox) {
+        return Number(comboBox.getSelectedIndex()) + 1;
+    }
+
+    function promptForMultiRunSetup(calibration) {
+        var ActionListener = Packages.java.awt.event.ActionListener;
+        var JComboBox = Packages.javax.swing.JComboBox;
+        var DefaultComboBoxModel = Packages.javax.swing.DefaultComboBoxModel;
+        var JScrollPane = Packages.javax.swing.JScrollPane;
+        var Dimension = Packages.java.awt.Dimension;
+        var multiConfig = calibration.multiConfig
+            ? clonePlainObject(calibration.multiConfig)
+            : defaultMultiTrayCalibration(calibration);
+
+        while (true) {
+            var panel = new JPanel(new BorderLayout(10, 10));
+            var topPanel = new JPanel(new GridLayout(0, 2, 8, 6));
+            topPanel.setBorder(BorderFactory.createTitledBorder('Run layout'));
+
+            function countBox(maxCount, selectedCount) {
+                var model = new DefaultComboBoxModel();
+                for (var i = 1; i <= maxCount; i++) {
+                    model.addElement(String(i));
+                }
+                var box = new JComboBox(model);
+                box.setSelectedIndex(Math.max(0, Math.min(maxCount - 1, Number(selectedCount || 1) - 1)));
+                return box;
+            }
+
+            var eventCountBox = countBox(2, multiConfig.active_collection_event_count);
+            var trayCountBox = countBox(4, multiConfig.active_sorting_tray_count);
+            var classifierModeModel = new DefaultComboBoxModel();
+            classifierModeModel.addElement('Train Debris Classifier');
+            classifierModeModel.addElement('Auto-Debris Classifier');
+            var classifierModeBox = new JComboBox(classifierModeModel);
+            classifierModeBox.setSelectedIndex(String(multiConfig.shared.debris_classifier_mode || 'train') === 'auto' ? 1 : 0);
+            topPanel.add(new JLabel('Collection events'));
+            topPanel.add(eventCountBox);
+            topPanel.add(new JLabel('Sorting trays'));
+            topPanel.add(trayCountBox);
+            topPanel.add(new JLabel('96-well plates'));
+            topPanel.add(new JLabel('One per collection event'));
+            topPanel.add(new JLabel('Recovery plates'));
+            topPanel.add(new JLabel('One per collection event'));
+            topPanel.add(new JLabel('Debris classifier'));
+            topPanel.add(classifierModeBox);
+
+            var eventsPanel = new JPanel(new GridLayout(0, 4, 8, 6));
+            eventsPanel.setBorder(BorderFactory.createTitledBorder('Collection events'));
+            var collectionCodeFields = [];
+            var plateNumberFields = [];
+            var startWellFields = [];
+
+            function saveVisibleEventFields() {
+                for (var saveEventSlot = 1; saveEventSlot <= 2; saveEventSlot++) {
+                    var saveEvent = multiSlotByNumber(multiConfig.collection_events, 'event_slot', saveEventSlot);
+                    var savePlate = multiSlotByNumber(multiConfig.plates, 'plate_slot', saveEventSlot);
+                    if (saveEvent && collectionCodeFields[saveEventSlot]) {
+                        saveEvent.collection_code = String(collectionCodeFields[saveEventSlot].getText()).trim();
+                    }
+                    if (savePlate && plateNumberFields[saveEventSlot]) {
+                        savePlate.plate_number = String(plateNumberFields[saveEventSlot].getText()).trim();
+                    }
+                    if (savePlate && startWellFields[saveEventSlot]) {
+                        savePlate.start_well = String(startWellFields[saveEventSlot].getText()).trim();
+                    }
+                }
+            }
+
+            function rebuildEventRows() {
+                saveVisibleEventFields();
+                eventsPanel.removeAll();
+                eventsPanel.add(new JLabel('Event'));
+                eventsPanel.add(new JLabel('Collection code'));
+                eventsPanel.add(new JLabel('Plate number'));
+                eventsPanel.add(new JLabel('Start well'));
+                var visibleEventCount = selectedOneBasedIndex(eventCountBox);
+                for (var eventSlot = 1; eventSlot <= visibleEventCount; eventSlot++) {
+                    var eventConfig = multiSlotByNumber(multiConfig.collection_events, 'event_slot', eventSlot);
+                    var plateConfig = multiSlotByNumber(multiConfig.plates, 'plate_slot', eventSlot);
+                    var collectionCodeField = new JTextField(String(eventConfig ? eventConfig.collection_code || '' : ''), 10);
+                    var plateNumberField = new JTextField(String(plateConfig ? plateConfig.plate_number || ('AA000' + eventSlot) : ('AA000' + eventSlot)), 10);
+                    var startWellField = new JTextField(String(plateConfig ? plateConfig.start_well || 'A1' : 'A1'), 6);
+                    collectionCodeFields[eventSlot] = collectionCodeField;
+                    plateNumberFields[eventSlot] = plateNumberField;
+                    startWellFields[eventSlot] = startWellField;
+                    eventsPanel.add(new JLabel('Event ' + eventSlot));
+                    eventsPanel.add(collectionCodeField);
+                    eventsPanel.add(plateNumberField);
+                    eventsPanel.add(startWellField);
+                }
+                eventsPanel.revalidate();
+                eventsPanel.repaint();
+            }
+            rebuildEventRows();
+
+            var traysPanel = new JPanel(new GridLayout(0, 2, 8, 6));
+            traysPanel.setBorder(BorderFactory.createTitledBorder('Sorting tray assignments'));
+            var trayEventBoxes = [];
+
+            function saveVisibleTrayFields() {
+                for (var saveTraySlot = 1; saveTraySlot <= 4; saveTraySlot++) {
+                    var saveTray = multiSlotByNumber(multiConfig.sorting_trays, 'tray_slot', saveTraySlot);
+                    if (saveTray && trayEventBoxes[saveTraySlot]) {
+                        saveTray.collection_event_slot = selectedOneBasedIndex(trayEventBoxes[saveTraySlot]);
+                    }
+                }
+            }
+
+            function eventAssignmentBox(selectedEventSlot) {
+                var model = new DefaultComboBoxModel();
+                model.addElement('Event 1');
+                model.addElement('Event 2');
+                var box = new JComboBox(model);
+                box.setSelectedIndex(Math.max(0, Math.min(1, Number(selectedEventSlot || 1) - 1)));
+                return box;
+            }
+
+            function rebuildTrayRows() {
+                saveVisibleTrayFields();
+                trayEventBoxes = [];
+                traysPanel.removeAll();
+                traysPanel.add(new JLabel('Sorting tray'));
+                traysPanel.add(new JLabel('Collection event'));
+                var visibleTrayCount = selectedOneBasedIndex(trayCountBox);
+                for (var traySlot = 1; traySlot <= visibleTrayCount; traySlot++) {
+                    var trayConfig = multiSlotByNumber(multiConfig.sorting_trays, 'tray_slot', traySlot);
+                    var trayEventBox = eventAssignmentBox(trayConfig ? trayConfig.collection_event_slot : 1);
+                    trayEventBoxes[traySlot] = trayEventBox;
+                    traysPanel.add(new JLabel('Tray ' + traySlot));
+                    traysPanel.add(trayEventBox);
+                }
+                traysPanel.revalidate();
+                traysPanel.repaint();
+            }
+            rebuildTrayRows();
+
+            eventCountBox.addActionListener(new ActionListener({
+                actionPerformed: function(event) {
+                    rebuildEventRows();
+                    rebuildTrayRows();
+                }
+            }));
+            trayCountBox.addActionListener(new ActionListener({
+                actionPerformed: function(event) {
+                    rebuildTrayRows();
+                }
+            }));
+
+            panel.add(topPanel, BorderLayout.NORTH);
+            var centerPanel = new JPanel(new GridLayout(1, 2, 10, 8));
+            centerPanel.add(eventsPanel);
+            centerPanel.add(traysPanel);
+            panel.add(centerPanel, BorderLayout.CENTER);
+            panel.add(
+                new JLabel('<html>Cross-sample guard: each collection event uses its matching plate and recovery plate. '
+                    + 'Only enabled trays are used in this run.</html>'),
+                BorderLayout.SOUTH
+            );
+
+            var setupScroll = new JScrollPane(panel);
+            setupScroll.setPreferredSize(new Dimension(760, 520));
+            var result = JOptionPane.showConfirmDialog(
+                null,
+                setupScroll,
+                'BugPicker run setup',
+                JOptionPane.OK_CANCEL_OPTION,
+                JOptionPane.QUESTION_MESSAGE
+            );
+            if (result !== JOptionPane.OK_OPTION) {
+                throw new Error('Run setup was cancelled.');
+            }
+
+            try {
+                saveVisibleEventFields();
+                saveVisibleTrayFields();
+                var eventCount = selectedOneBasedIndex(eventCountBox);
+                var trayCount = selectedOneBasedIndex(trayCountBox);
+                multiConfig.active_collection_event_count = eventCount;
+                multiConfig.active_sorting_tray_count = trayCount;
+                multiConfig.active_plate_count = eventCount;
+                multiConfig.active_recovery_plate_count = eventCount;
+                multiConfig.shared.debris_classifier_mode = classifierModeBox.getSelectedIndex() === 1 ? 'auto' : 'train';
+
+                for (var updateEventSlot = 1; updateEventSlot <= 2; updateEventSlot++) {
+                    var updateEvent = multiSlotByNumber(multiConfig.collection_events, 'event_slot', updateEventSlot);
+                    var updatePlate = multiSlotByNumber(multiConfig.plates, 'plate_slot', updateEventSlot);
+                    var updateRecovery = multiSlotByNumber(multiConfig.recovery_plates, 'recovery_slot', updateEventSlot);
+                    var enabledEvent = updateEventSlot <= eventCount;
+                    if (updateEvent) {
+                        updateEvent.enabled = enabledEvent;
+                        updateEvent.plate_slot = updateEventSlot;
+                        updateEvent.recovery_slot = updateEventSlot;
+                        if (enabledEvent) {
+                            updateEvent.collection_code = String(collectionCodeFields[updateEventSlot].getText()).trim();
+                            if (updateEvent.collection_code.length === 0) {
+                                throw new Error('Collection code is required for event ' + updateEventSlot + '.');
+                            }
+                        }
+                    }
+                    if (updatePlate) {
+                        updatePlate.enabled = enabledEvent;
+                        if (enabledEvent) {
+                            updatePlate.plate_number = normalizePlateNumber(plateNumberFields[updateEventSlot].getText());
+                            updatePlate.start_well = normalizeWellName(startWellFields[updateEventSlot].getText());
+                        }
+                    }
+                    if (updateRecovery) {
+                        updateRecovery.enabled = enabledEvent;
+                    }
+                }
+
+                var enabledEventSeen = {};
+                for (var updateTraySlot = 1; updateTraySlot <= 4; updateTraySlot++) {
+                    var updateTray = multiSlotByNumber(multiConfig.sorting_trays, 'tray_slot', updateTraySlot);
+                    var trayEnabled = updateTraySlot <= trayCount;
+                    var assignedEvent = trayEventBoxes[updateTraySlot]
+                        ? selectedOneBasedIndex(trayEventBoxes[updateTraySlot])
+                        : Number(updateTray ? updateTray.collection_event_slot || 1 : 1);
+                    if (trayEnabled && assignedEvent > eventCount) {
+                        throw new Error('Tray ' + updateTraySlot + ' is assigned to disabled event ' + assignedEvent + '.');
+                    }
+                    if (updateTray) {
+                        updateTray.enabled = trayEnabled;
+                        updateTray.collection_event_slot = trayEnabled ? assignedEvent : Math.min(assignedEvent, eventCount);
+                    }
+                    if (trayEnabled) {
+                        enabledEventSeen[String(assignedEvent)] = true;
+                    }
+                }
+                for (var requiredEvent = 1; requiredEvent <= eventCount; requiredEvent++) {
+                    if (!enabledEventSeen[String(requiredEvent)]) {
+                        throw new Error('Event ' + requiredEvent + ' needs at least one enabled sorting tray.');
+                    }
+                }
+
+                calibration.multiConfig = multiConfig;
+                writeText(multiTrayCalibrationFile(), JSON.stringify(multiConfig, null, 2) + '\n');
+                print('Saved BugPicker run setup: ' + multiTrayCalibrationFile().getAbsolutePath());
+                return calibration;
+            }
+            catch (validationError) {
+                JOptionPane.showMessageDialog(
+                    null,
+                    String(validationError.message || validationError),
+                    'Invalid run setup',
+                    JOptionPane.ERROR_MESSAGE
+                );
+            }
+        }
+    }
+
+    function activeSortingTrayConfigs(multiConfig) {
+        var trays = [];
+        if (!multiConfig || !multiConfig.sorting_trays) {
+            return trays;
+        }
+        for (var i = 0; i < multiConfig.sorting_trays.length; i++) {
+            var tray = multiConfig.sorting_trays[i];
+            if (!tray.enabled) {
+                continue;
+            }
+            var eventSlot = Number(tray.collection_event_slot || 1);
+            var eventConfig = multiSlotByNumber(multiConfig.collection_events, 'event_slot', eventSlot);
+            var plateSlot = eventConfig ? Number(eventConfig.plate_slot || eventSlot) : eventSlot;
+            var recoverySlot = eventConfig ? Number(eventConfig.recovery_slot || eventSlot) : eventSlot;
+            trays.push({
+                traySlot: Number(tray.tray_slot || (i + 1)),
+                collectionEventSlot: eventSlot,
+                plateSlot: plateSlot,
+                recoverySlot: recoverySlot,
+                xLeft: Number(tray.x_left_mm),
+                xRight: Number(tray.x_right_mm),
+                yTop: Number(tray.y_top_mm),
+                yBottom: Number(tray.y_bottom_mm),
+                trayHeightMm: Number(tray.tray_height_mm),
+                sizeClass: String(tray.size_class || ''),
+                pickZMm: Number(tray.pick_z_mm)
+            });
+        }
+        trays.sort(function(left, right) {
+            return left.traySlot - right.traySlot;
+        });
+        return trays;
+    }
+
+    function scanFrameCountForTray(tray, xStepMm, yStepMm) {
+        var xStart = Math.min(Number(tray.xLeft), Number(tray.xRight));
+        var xEnd = Math.max(Number(tray.xLeft), Number(tray.xRight));
+        var yStart = Math.min(Number(tray.yTop), Number(tray.yBottom));
+        var yEnd = Math.max(Number(tray.yTop), Number(tray.yBottom));
+        return positions(xStart, xEnd, Number(xStepMm), false).length
+            * positions(yStart, yEnd, Number(yStepMm), false).length;
+    }
+
+    function plateContextForSlot(multiConfig, plateSlot) {
+        var eventConfig = multiSlotByNumber(multiConfig.collection_events, 'event_slot', plateSlot);
+        var plateConfig = multiSlotByNumber(multiConfig.plates, 'plate_slot', plateSlot);
+        var recoveryConfig = multiSlotByNumber(multiConfig.recovery_plates, 'recovery_slot', plateSlot);
+        if (!plateConfig || !recoveryConfig) {
+            throw new Error('Missing plate or recovery calibration for slot ' + plateSlot + '.');
+        }
+        var plateNumber = normalizePlateNumber(plateConfig.plate_number);
+        return {
+            plateNumber: plateNumber,
+            plateId: 'P-' + plateNumber,
+            collectionCode: String(eventConfig ? eventConfig.collection_code || '' : '').trim(),
+            startWell: normalizeWellName(plateConfig.start_well),
+            plateSlot: Number(plateSlot),
+            recoverySlot: Number(plateSlot),
+            plateA1X: Number(plateConfig.plate_a1_x_mm),
+            plateA1Y: Number(plateConfig.plate_a1_y_mm),
+            plateQaCameraA1X: Number(plateConfig.plate_qa_camera_a1_x_mm),
+            plateQaCameraA1Y: Number(plateConfig.plate_qa_camera_a1_y_mm),
+            recoveryPlateA1X: Number(recoveryConfig.recovery_plate_a1_x_mm),
+            recoveryPlateA1Y: Number(recoveryConfig.recovery_plate_a1_y_mm),
+            plateWellPitchMm: Number(multiConfig.shared.plate_well_pitch_mm)
+        };
+    }
+
+    function activePlateContexts(multiConfig) {
+        var contexts = [];
+        var activeCount = Math.max(1, Math.min(2, Number(multiConfig.active_plate_count || 1)));
+        for (var plateSlot = 1; plateSlot <= activeCount; plateSlot++) {
+            contexts.push(plateContextForSlot(multiConfig, plateSlot));
+        }
+        return contexts;
     }
 
     function raisePickerToCalibrationTravelZ(nozzle, travelZ, context) {
@@ -370,47 +1061,111 @@ with (imports) {
         print('Top camera after ' + label + ' move: ' + formatLocation(camera.getLocation()));
     }
 
-    function commandPickerToPlateA1(nozzle, xField, yField, calibrationTravelZ) {
+    function commandPickerToA1(nozzle, xField, yField, calibrationTravelZ, xName, yName, label, zLabel, zValue) {
         if (nozzle === null) {
             throw new Error('Picker nozzle is not available.');
         }
-        var x = numberFieldValue(xField, 'plate_a1_x_mm');
-        var y = numberFieldValue(yField, 'plate_a1_y_mm');
+        var x = numberFieldValue(xField, xName);
+        var y = numberFieldValue(yField, yName);
         var travelZ = Number(calibrationTravelZ);
-        var dropZ = -33.5;
-        print('Moving picker to plate A1 candidate X=' + x.toFixed(3)
+        var z = Number(zValue);
+        print('Moving picker to ' + label + ' candidate X=' + x.toFixed(3)
             + ' Y=' + y.toFixed(3)
             + ' at current travel Z=' + travelZ.toFixed(3)
-            + ', then drop Z=' + dropZ.toFixed(3));
-        raisePickerToCalibrationTravelZ(nozzle, travelZ, 'plate A1 calibration move');
+            + ', then ' + zLabel + '=' + z.toFixed(3));
+        raisePickerToCalibrationTravelZ(nozzle, travelZ, label + ' calibration move');
         moveNozzleToXyAtZ(nozzle, x, y, travelZ);
-        warnDualNozzleZClearance(dropZ, 'plate A1 calibration descent');
-        moveNozzleToXyAtZ(nozzle, x, y, dropZ);
-        print('Picker after plate A1 move: ' + formatLocation(nozzle.location));
+        warnDualNozzleZClearance(z, label + ' calibration descent');
+        moveNozzleToXyAtZ(nozzle, x, y, z);
+        print('Picker after ' + label + ' move: ' + formatLocation(nozzle.location));
+    }
+
+    function commandPickerToPlateA1(nozzle, xField, yField, calibrationTravelZ) {
+        commandPickerToA1(nozzle, xField, yField, calibrationTravelZ, 'plate_a1_x_mm', 'plate_a1_y_mm', 'plate A1', 'drop Z', -33.5);
+    }
+
+    function commandHiResToPlateQaA1(nozzle, xField, yField, focusZField, calibrationTravelZ) {
+        if (nozzle === null) {
+            throw new Error('HiRes camera motion reference N1 is not available.');
+        }
+        var x = numberFieldValue(xField, 'plate_qa_camera_a1_x_mm');
+        var y = numberFieldValue(yField, 'plate_qa_camera_a1_y_mm');
+        var travelZ = Number(calibrationTravelZ);
+        var focusZ = Math.max(hiResMinimumZ, numberFieldValue(focusZField, 'hires_focus_z_mm'));
+        print('Moving HiRes camera carrier to plate QA A1 candidate X=' + x.toFixed(3)
+            + ' Y=' + y.toFixed(3)
+            + ' then focus Z=' + focusZ.toFixed(3)
+            + ' using N1 coordinate frame');
+        raisePickerToCalibrationTravelZ(nozzle, travelZ, 'plate QA A1 HiRes calibration move');
+        moveNozzleToXyAtZ(nozzle, x, y, travelZ);
+        moveNozzleToXyAtZ(nozzle, x, y, focusZ);
+        print('HiRes camera carrier after plate QA A1 move: ' + formatLocation(nozzle.location));
+    }
+
+    function commandPickerToRecoveryPlateA1Xy(nozzle, xField, yField, calibrationTravelZ) {
+        if (nozzle === null) {
+            throw new Error('Picker nozzle is not available.');
+        }
+        var x = numberFieldValue(xField, 'recovery_plate_a1_x_mm');
+        var y = numberFieldValue(yField, 'recovery_plate_a1_y_mm');
+        var travelZ = Number(calibrationTravelZ);
+        print('Moving picker to recovery plate A1 XY candidate X=' + x.toFixed(3)
+            + ' Y=' + y.toFixed(3)
+            + ' at travel Z=' + travelZ.toFixed(3));
+        raisePickerToCalibrationTravelZ(nozzle, travelZ, 'recovery plate A1 XY calibration move');
+        moveNozzleToXyAtZ(nozzle, x, y, travelZ);
+        print('Picker after recovery plate A1 XY move: ' + formatLocation(nozzle.location));
+    }
+
+    function commandPickerToRecoveryPlateA1Z(nozzle, calibrationTravelZ) {
+        if (nozzle === null) {
+            throw new Error('Picker nozzle is not available.');
+        }
+        var travelZ = Number(calibrationTravelZ);
+        var wipeZ = -42.0;
+        var x = Number(nozzle.location.x);
+        var y = Number(nozzle.location.y);
+        print('Dropping picker to recovery plate wipe Z=' + wipeZ.toFixed(3)
+            + ' for 1.0s, then returning to travel Z=' + travelZ.toFixed(3));
+        warnDualNozzleZClearance(wipeZ, 'recovery plate A1 Z calibration descent');
+        moveNozzleToXyAtZ(nozzle, x, y, wipeZ);
+        Packages.java.lang.Thread.sleep(1000);
+        moveNozzleToXyAtZ(nozzle, x, y, travelZ);
+        print('Picker after recovery plate A1 Z probe: ' + formatLocation(nozzle.location));
     }
 
     function promptForTrainingTrayBounds(calibration, camera, nozzle) {
         var calibrationTravelZ = nozzle === null ? null : Number(nozzle.location.z);
+        var hiResCalibrationTravelZ = calibrationTravelZ;
         while (true) {
             var ActionListener = Packages.java.awt.event.ActionListener;
             var JComboBox = Packages.javax.swing.JComboBox;
             var DefaultComboBoxModel = Packages.javax.swing.DefaultComboBoxModel;
-            var panel = new JPanel(new GridLayout(3, 2, 12, 6));
+            var DocumentListener = Packages.javax.swing.event.DocumentListener;
+            var panel = new JPanel(new BorderLayout(12, 6));
+            var calibrationPanel = new JPanel(new GridLayout(0, 2, 12, 6));
+            var jogDock = new JPanel(new BorderLayout(6, 6));
+            jogDock.setBorder(BorderFactory.createTitledBorder('Jog controls'));
+            jogDock.add(new JLabel('<html>Select a Jog button<br>from a calibration box.</html>'), BorderLayout.CENTER);
             var startPanel = new JPanel(new GridLayout(0, 2, 8, 6));
             var endPanel = new JPanel(new GridLayout(0, 2, 8, 6));
             var heightPanel = new JPanel(new GridLayout(0, 2, 8, 6));
             var platePanel = new JPanel(new GridLayout(0, 2, 8, 6));
-            var runPanel = new JPanel(new GridLayout(0, 2, 8, 6));
+            var recoveryPlatePanel = new JPanel(new GridLayout(0, 2, 8, 6));
             var xLeftField = new JTextField(calibration.xLeft.toFixed(3), 10);
             var xRightField = new JTextField(calibration.xRight.toFixed(3), 10);
             var yTopField = new JTextField(calibration.yTop.toFixed(3), 10);
             var yBottomField = new JTextField(calibration.yBottom.toFixed(3), 10);
+            var imageCountField = new JTextField('', 10);
+            imageCountField.setEditable(false);
             var plateA1XField = new JTextField(Number(calibration.plateA1X).toFixed(3), 10);
             var plateA1YField = new JTextField(Number(calibration.plateA1Y).toFixed(3), 10);
+            var plateQaCameraA1XField = new JTextField(Number(calibration.plateQaCameraA1X).toFixed(3), 10);
+            var plateQaCameraA1YField = new JTextField(Number(calibration.plateQaCameraA1Y).toFixed(3), 10);
+            var hiResFocusZField = new JTextField(Number(calibration.hiResFocusZMm).toFixed(3), 10);
+            var recoveryPlateA1XField = new JTextField(Number(calibration.recoveryPlateA1X).toFixed(3), 10);
+            var recoveryPlateA1YField = new JTextField(Number(calibration.recoveryPlateA1Y).toFixed(3), 10);
             var platePitchField = new JTextField(Number(calibration.plateWellPitchMm).toFixed(3), 10);
-            var startWellField = new JTextField('A1', 10);
-            var plateNumberField = new JTextField('AA0001', 10);
-            var collectionCodeField = new JTextField('', 10);
             var trayHeightField = new JTextField(Number(calibration.trayHeightMm).toFixed(3), 10);
             var sizeClassField = new JTextField(String(calibration.sizeClass), 10);
             var pickZField = new JTextField(Number(calibration.pickZMm).toFixed(3), 10);
@@ -424,22 +1179,323 @@ with (imports) {
             var startMoveButton = new JButton('Move camera');
             var endMoveButton = new JButton('Move camera');
             var plateA1MoveButton = new JButton('Move picker to drop Z');
+            var plateQaCameraA1MoveButton = new JButton('Move HiRes to QA A1');
+            var recoveryPlateA1XyButton = new JButton('Move picker to X,Y');
+            var recoveryPlateA1ZButton = new JButton('Drop to picker Z');
+            var traySlotModel = new DefaultComboBoxModel();
+            for (var traySlotOption = 1; traySlotOption <= 4; traySlotOption++) {
+                traySlotModel.addElement('Tray ' + traySlotOption);
+            }
+            var traySlotBox = new JComboBox(traySlotModel);
+            var plateSlotModel = new DefaultComboBoxModel();
+            for (var plateSlotOption = 1; plateSlotOption <= 2; plateSlotOption++) {
+                plateSlotModel.addElement('Plate ' + plateSlotOption);
+            }
+            var plateSlotBox = new JComboBox(plateSlotModel);
+            var recoverySlotModel = new DefaultComboBoxModel();
+            for (var recoverySlotOption = 1; recoverySlotOption <= 2; recoverySlotOption++) {
+                recoverySlotModel.addElement('Recovery ' + recoverySlotOption);
+            }
+            var recoverySlotBox = new JComboBox(recoverySlotModel);
+            var currentTraySlot = 1;
+            var currentPlateSlot = 1;
+            var currentRecoverySlot = 1;
+
+            function activeMultiConfig() {
+                if (!calibration.multiConfig) {
+                    calibration.multiConfig = defaultMultiTrayCalibration(calibration);
+                }
+                return calibration.multiConfig;
+            }
+
+            function saveTrayFields(slot) {
+                var config = activeMultiConfig();
+                var tray = multiSlotByNumber(config.sorting_trays, 'tray_slot', slot);
+                if (!tray) {
+                    return;
+                }
+                tray.x_left_mm = numberFieldValue(xLeftField, 'x_left_mm');
+                tray.x_right_mm = numberFieldValue(xRightField, 'x_right_mm');
+                tray.y_top_mm = numberFieldValue(yTopField, 'y_top_mm');
+                tray.y_bottom_mm = numberFieldValue(yBottomField, 'y_bottom_mm');
+                tray.tray_height_mm = numberFieldValue(trayHeightField, 'tray_height_mm');
+                tray.size_class = String(sizeClassField.getText()).trim();
+                tray.pick_z_mm = numberFieldValue(pickZField, 'pick_z_mm');
+            }
+
+            function loadTrayFields(slot) {
+                var config = activeMultiConfig();
+                var tray = multiSlotByNumber(config.sorting_trays, 'tray_slot', slot);
+                if (!tray) {
+                    return;
+                }
+                xLeftField.setText(Number(tray.x_left_mm).toFixed(3));
+                xRightField.setText(Number(tray.x_right_mm).toFixed(3));
+                yTopField.setText(Number(tray.y_top_mm).toFixed(3));
+                yBottomField.setText(Number(tray.y_bottom_mm).toFixed(3));
+                trayHeightField.setText(Number(tray.tray_height_mm).toFixed(3));
+                sizeClassField.setText(String(tray.size_class || ''));
+                pickZField.setText(Number(tray.pick_z_mm).toFixed(3));
+                updateImageCountField();
+            }
+
+            function savePlateFields(slot) {
+                var config = activeMultiConfig();
+                var plate = multiSlotByNumber(config.plates, 'plate_slot', slot);
+                var event = multiSlotByNumber(config.collection_events, 'event_slot', slot);
+                if (!plate) {
+                    return;
+                }
+                plate.plate_a1_x_mm = numberFieldValue(plateA1XField, 'plate_a1_x_mm');
+                plate.plate_a1_y_mm = numberFieldValue(plateA1YField, 'plate_a1_y_mm');
+                plate.plate_qa_camera_a1_x_mm = numberFieldValue(plateQaCameraA1XField, 'plate_qa_camera_a1_x_mm');
+                plate.plate_qa_camera_a1_y_mm = numberFieldValue(plateQaCameraA1YField, 'plate_qa_camera_a1_y_mm');
+            }
+
+            function loadPlateFields(slot) {
+                var config = activeMultiConfig();
+                var plate = multiSlotByNumber(config.plates, 'plate_slot', slot);
+                var event = multiSlotByNumber(config.collection_events, 'event_slot', slot);
+                if (!plate) {
+                    return;
+                }
+                plateA1XField.setText(Number(plate.plate_a1_x_mm).toFixed(3));
+                plateA1YField.setText(Number(plate.plate_a1_y_mm).toFixed(3));
+                plateQaCameraA1XField.setText(Number(plate.plate_qa_camera_a1_x_mm).toFixed(3));
+                plateQaCameraA1YField.setText(Number(plate.plate_qa_camera_a1_y_mm).toFixed(3));
+            }
+
+            function saveRecoveryFields(slot) {
+                var config = activeMultiConfig();
+                var recovery = multiSlotByNumber(config.recovery_plates, 'recovery_slot', slot);
+                if (!recovery) {
+                    return;
+                }
+                recovery.recovery_plate_a1_x_mm = numberFieldValue(recoveryPlateA1XField, 'recovery_plate_a1_x_mm');
+                recovery.recovery_plate_a1_y_mm = numberFieldValue(recoveryPlateA1YField, 'recovery_plate_a1_y_mm');
+            }
+
+            function loadRecoveryFields(slot) {
+                var config = activeMultiConfig();
+                var recovery = multiSlotByNumber(config.recovery_plates, 'recovery_slot', slot);
+                if (!recovery) {
+                    return;
+                }
+                recoveryPlateA1XField.setText(Number(recovery.recovery_plate_a1_x_mm).toFixed(3));
+                recoveryPlateA1YField.setText(Number(recovery.recovery_plate_a1_y_mm).toFixed(3));
+            }
+
+            function jogStepValue(stepField) {
+                var value = Number(String(stepField.getText()).trim());
+                if (isNaN(value) || value <= 0) {
+                    throw new Error('Jog step must be a positive number.');
+                }
+                return value;
+            }
+
+            function updateTrayFieldsFromCamera(xField, yField) {
+                var location = camera.getLocation();
+                var x = calibration.scanBoundsAreCameraCoordinates
+                    ? Number(location.x)
+                    : Number(location.x) - Number(calibration.cameraXOffsetMm);
+                var y = calibration.scanBoundsAreCameraCoordinates
+                    ? Number(location.y)
+                    : Number(location.y) - Number(calibration.cameraYOffsetMm);
+                xField.setText(x.toFixed(3));
+                yField.setText(y.toFixed(3));
+                updateImageCountField();
+            }
+
+            function updateCameraFieldsFromCurrentLocation(xField, yField) {
+                var location = camera.getLocation();
+                xField.setText(Number(location.x).toFixed(3));
+                yField.setText(Number(location.y).toFixed(3));
+            }
+
+            function updatePickerFieldsFromCurrentLocation(xField, yField, jogNozzle) {
+                var activeNozzle = jogNozzle || nozzle;
+                if (activeNozzle === null) {
+                    throw new Error('Requested nozzle is not available.');
+                }
+                var location = activeNozzle.location;
+                xField.setText(Number(location.x).toFixed(3));
+                yField.setText(Number(location.y).toFixed(3));
+            }
+
+            function jogCameraBy(stepField, dx, dy, xField, yField, updateFields) {
+                var step = jogStepValue(stepField);
+                raisePickerToCalibrationTravelZ(nozzle, calibrationTravelZ, 'Top camera XY jog');
+                var location = camera.getLocation();
+                moveCameraToXy(camera, Number(location.x) + (dx * step), Number(location.y) + (dy * step));
+                updateFields(xField, yField);
+                print('Jogged Top camera to ' + formatLocation(camera.getLocation()));
+            }
+
+            function jogPickerBy(stepField, dx, dy, xField, yField, jogNozzle, jogTravelZ, label) {
+                var activeNozzle = jogNozzle || nozzle;
+                if (activeNozzle === null) {
+                    throw new Error('Requested nozzle is not available.');
+                }
+                var step = jogStepValue(stepField);
+                var travelZ = isNaN(Number(jogTravelZ)) ? Number(activeNozzle.location.z) : Number(jogTravelZ);
+                raisePickerToCalibrationTravelZ(activeNozzle, travelZ, label || 'XY jog');
+                moveNozzleToXyAtZ(
+                    activeNozzle,
+                    Number(activeNozzle.location.x) + (dx * step),
+                    Number(activeNozzle.location.y) + (dy * step),
+                    travelZ
+                );
+                updatePickerFieldsFromCurrentLocation(xField, yField, activeNozzle);
+                print('Jogged ' + (label || 'picker') + ' to ' + formatLocation(activeNozzle.location));
+            }
+
+            function makeJogPanel(title, detailProvider, xField, yField, isCamera, updateFields, jogNozzle, jogTravelZ, jogLabel) {
+                var jogPanel = new JPanel(new BorderLayout(6, 6));
+                jogPanel.setBorder(BorderFactory.createTitledBorder(title));
+                var detailLabel = new JLabel('<html>' + String(detailProvider()) + '</html>');
+                var statusLabel = new JLabel('Record has not been pressed.');
+                var controlsPanel = new JPanel(new GridLayout(0, 3, 4, 4));
+                var stepField = new JTextField('1.000', 6);
+                var leftButton = new JButton('-X');
+                var rightButton = new JButton('+X');
+                var upButton = new JButton('+Y');
+                var downButton = new JButton('-Y');
+                var recordButton = new JButton('Record');
+
+                function runJog(dx, dy) {
+                    try {
+                        if (isCamera) {
+                            jogCameraBy(stepField, dx, dy, xField, yField, updateFields);
+                        }
+                        else {
+                            jogPickerBy(stepField, dx, dy, xField, yField, jogNozzle, jogTravelZ, jogLabel);
+                        }
+                    }
+                    catch (error) {
+                        JOptionPane.showMessageDialog(
+                            null,
+                            String(error.message || error),
+                            'Jog failed',
+                            JOptionPane.ERROR_MESSAGE
+                        );
+                    }
+                }
+
+                recordButton.addActionListener(new ActionListener({
+                    actionPerformed: function(event) {
+                        try {
+                            var detail = String(detailProvider());
+                            if (isCamera) {
+                                raisePickerToCalibrationTravelZ(nozzle, calibrationTravelZ, 'camera jog record');
+                            }
+                            else {
+                                raisePickerToCalibrationTravelZ(jogNozzle || nozzle, Number(jogTravelZ), 'jog record');
+                            }
+                            if (isCamera) {
+                                updateFields(xField, yField);
+                            }
+                            else {
+                                updatePickerFieldsFromCurrentLocation(xField, yField, jogNozzle || nozzle);
+                            }
+                            detailLabel.setText('<html>' + detail + '</html>');
+                            statusLabel.setText('Recorded X=' + xField.getText() + ' Y=' + yField.getText());
+                        }
+                        catch (error) {
+                            JOptionPane.showMessageDialog(
+                                null,
+                                String(error.message || error),
+                                'Record failed',
+                                JOptionPane.ERROR_MESSAGE
+                            );
+                        }
+                    }
+                }));
+                leftButton.addActionListener(new ActionListener({ actionPerformed: function(event) { runJog(-1, 0); } }));
+                rightButton.addActionListener(new ActionListener({ actionPerformed: function(event) { runJog(1, 0); } }));
+                upButton.addActionListener(new ActionListener({ actionPerformed: function(event) { runJog(0, 1); } }));
+                downButton.addActionListener(new ActionListener({ actionPerformed: function(event) { runJog(0, -1); } }));
+
+                controlsPanel.add(new JLabel('Step mm'));
+                controlsPanel.add(stepField);
+                controlsPanel.add(recordButton);
+                controlsPanel.add(new JLabel(''));
+                controlsPanel.add(upButton);
+                controlsPanel.add(new JLabel(''));
+                controlsPanel.add(leftButton);
+                controlsPanel.add(downButton);
+                controlsPanel.add(rightButton);
+                jogPanel.add(detailLabel, BorderLayout.NORTH);
+                jogPanel.add(controlsPanel, BorderLayout.CENTER);
+                jogPanel.add(statusLabel, BorderLayout.SOUTH);
+                return jogPanel;
+            }
+
+            function showJogControls(title, detailProvider, xField, yField, isCamera, updateFields, jogNozzle, jogTravelZ, jogLabel) {
+                jogDock.removeAll();
+                jogDock.setBorder(BorderFactory.createTitledBorder('Jog controls: ' + title));
+                jogDock.add(makeJogPanel(title, detailProvider, xField, yField, isCamera, updateFields, jogNozzle, jogTravelZ, jogLabel), BorderLayout.NORTH);
+                jogDock.revalidate();
+                jogDock.repaint();
+            }
+
+            function makeJogWindowButton(title, detailProvider, xField, yField, isCamera, updateFields, jogNozzle, jogTravelZ, jogLabel) {
+                var button = new JButton(title);
+                button.addActionListener(new ActionListener({
+                    actionPerformed: function(event) {
+                        showJogControls(title, detailProvider, xField, yField, isCamera, updateFields, jogNozzle, jogTravelZ, jogLabel);
+                    }
+                }));
+                return button;
+            }
+
+            function trayStartJogDetail() {
+                return 'Calibrating sorting tray ' + currentTraySlot
+                    + ' starting position. Record updates x_left_mm and y_top_mm.';
+            }
+
+            function trayEndJogDetail() {
+                return 'Calibrating sorting tray ' + currentTraySlot
+                    + ' ending position. Record updates x_right_mm and y_bottom_mm.';
+            }
+
+            function plateA1JogDetail() {
+                return 'Calibrating 96-well plate ' + currentPlateSlot
+                    + ' picker A1. Record updates A1 X mm and A1 Y mm.';
+            }
+
+            function plateQaA1JogDetail() {
+                return 'Calibrating 96-well plate ' + currentPlateSlot
+                    + ' HiRes camera A1. Record updates QA camera A1 X mm and QA camera A1 Y mm.';
+            }
+
+            function recoveryA1JogDetail() {
+                return 'Calibrating recovery plate ' + currentRecoverySlot
+                    + ' picker A1. Record updates A1 X mm and A1 Y mm.';
+            }
 
             startPanel.setBorder(BorderFactory.createTitledBorder('Starting position'));
+            startPanel.add(new JLabel('Sorting tray'));
+            startPanel.add(traySlotBox);
             startPanel.add(new JLabel('X (x_left_mm)'));
             startPanel.add(xLeftField);
             startPanel.add(new JLabel('Y (y_top_mm)'));
             startPanel.add(yTopField);
             startPanel.add(new JLabel(''));
             startPanel.add(startMoveButton);
+            startPanel.add(new JLabel(''));
+            startPanel.add(makeJogWindowButton('Jog Top camera', trayStartJogDetail, xLeftField, yTopField, true, updateTrayFieldsFromCamera));
 
             endPanel.setBorder(BorderFactory.createTitledBorder('Ending position'));
             endPanel.add(new JLabel('X (x_right_mm)'));
             endPanel.add(xRightField);
             endPanel.add(new JLabel('Y (y_bottom_mm)'));
             endPanel.add(yBottomField);
+            endPanel.add(new JLabel('Scan images'));
+            endPanel.add(imageCountField);
             endPanel.add(new JLabel(''));
             endPanel.add(endMoveButton);
+            endPanel.add(new JLabel(''));
+            endPanel.add(makeJogWindowButton('Jog Top camera', trayEndJogDetail, xRightField, yBottomField, true, updateTrayFieldsFromCamera));
 
             heightPanel.setBorder(BorderFactory.createTitledBorder('Tray height / pick Z'));
             heightPanel.add(new JLabel('Preset'));
@@ -452,6 +1508,8 @@ with (imports) {
             heightPanel.add(pickZField);
 
             platePanel.setBorder(BorderFactory.createTitledBorder('96-well plate'));
+            platePanel.add(new JLabel('Plate slot'));
+            platePanel.add(plateSlotBox);
             platePanel.add(new JLabel('A1 X mm'));
             platePanel.add(plateA1XField);
             platePanel.add(new JLabel('A1 Y mm'));
@@ -460,31 +1518,32 @@ with (imports) {
             platePanel.add(platePitchField);
             platePanel.add(new JLabel(''));
             platePanel.add(plateA1MoveButton);
+            platePanel.add(new JLabel(''));
+            platePanel.add(makeJogWindowButton('Jog picker', plateA1JogDetail, plateA1XField, plateA1YField, false, null, nozzle, calibrationTravelZ, 'picker'));
+            platePanel.add(new JLabel('HiRes A1 X mm'));
+            platePanel.add(plateQaCameraA1XField);
+            platePanel.add(new JLabel('HiRes A1 Y mm'));
+            platePanel.add(plateQaCameraA1YField);
+            platePanel.add(new JLabel('HiRes focus Z mm'));
+            platePanel.add(hiResFocusZField);
+            platePanel.add(new JLabel(''));
+            platePanel.add(plateQaCameraA1MoveButton);
+            platePanel.add(new JLabel(''));
+            platePanel.add(makeJogWindowButton('Jog HiRes camera', plateQaA1JogDetail, plateQaCameraA1XField, plateQaCameraA1YField, false, null, nozzle, hiResCalibrationTravelZ, 'HiRes camera'));
 
-            runPanel.setBorder(BorderFactory.createTitledBorder('Plating run'));
-            runPanel.add(new JLabel('Begin plating in well'));
-            runPanel.add(startWellField);
-            runPanel.add(new JLabel('Plate number'));
-            runPanel.add(plateNumberField);
-            runPanel.add(new JLabel('Collection code'));
-            runPanel.add(collectionCodeField);
-
-            plateNumberField.addActionListener(new ActionListener({
-                actionPerformed: function(event) {
-                    try {
-                        var normalized = normalizePlateNumber(plateNumberField.getText());
-                        plateNumberField.setText(normalized);
-                    }
-                    catch (error) {
-                        JOptionPane.showMessageDialog(
-                            null,
-                            String(error.message || error),
-                            'Invalid plate number',
-                            JOptionPane.ERROR_MESSAGE
-                        );
-                    }
-                }
-            }));
+            recoveryPlatePanel.setBorder(BorderFactory.createTitledBorder('Recovery plate'));
+            recoveryPlatePanel.add(new JLabel('Recovery slot'));
+            recoveryPlatePanel.add(recoverySlotBox);
+            recoveryPlatePanel.add(new JLabel('A1 X mm'));
+            recoveryPlatePanel.add(recoveryPlateA1XField);
+            recoveryPlatePanel.add(new JLabel('A1 Y mm'));
+            recoveryPlatePanel.add(recoveryPlateA1YField);
+            recoveryPlatePanel.add(new JLabel(''));
+            recoveryPlatePanel.add(recoveryPlateA1XyButton);
+            recoveryPlatePanel.add(new JLabel(''));
+            recoveryPlatePanel.add(makeJogWindowButton('Jog picker', recoveryA1JogDetail, recoveryPlateA1XField, recoveryPlateA1YField, false, null, nozzle, calibrationTravelZ, 'picker'));
+            recoveryPlatePanel.add(new JLabel(''));
+            recoveryPlatePanel.add(recoveryPlateA1ZButton);
 
             function applyTrayPreset(index) {
                 var preset = presets[Math.max(0, Math.min(index, presets.length - 1))];
@@ -496,6 +1555,103 @@ with (imports) {
             trayPresetBox.addActionListener(new ActionListener({
                 actionPerformed: function(event) {
                     applyTrayPreset(trayPresetBox.getSelectedIndex());
+                }
+            }));
+
+            function updateImageCountField() {
+                try {
+                    var xLeft = numberFieldValue(xLeftField, 'x_left_mm');
+                    var xRight = numberFieldValue(xRightField, 'x_right_mm');
+                    var yTop = numberFieldValue(yTopField, 'y_top_mm');
+                    var yBottom = numberFieldValue(yBottomField, 'y_bottom_mm');
+                    var xStart = Math.min(xLeft, xRight);
+                    var xEnd = Math.max(xLeft, xRight);
+                    var yStart = Math.min(yTop, yBottom);
+                    var yEnd = Math.max(yTop, yBottom);
+                    var xCount = positions(xStart, xEnd, Number(calibration.xStepMm), false).length;
+                    var yCount = positions(yStart, yEnd, Number(calibration.yStepMm), false).length;
+                    imageCountField.setText(String(xCount * yCount) + ' (' + xCount + ' x ' + yCount + ')');
+                }
+                catch (error) {
+                    imageCountField.setText('Invalid bounds');
+                }
+            }
+
+            function addImageCountListener(field) {
+                field.getDocument().addDocumentListener(new DocumentListener({
+                    insertUpdate: function(event) {
+                        updateImageCountField();
+                    },
+                    removeUpdate: function(event) {
+                        updateImageCountField();
+                    },
+                    changedUpdate: function(event) {
+                        updateImageCountField();
+                    }
+                }));
+            }
+
+            addImageCountListener(xLeftField);
+            addImageCountListener(xRightField);
+            addImageCountListener(yTopField);
+            addImageCountListener(yBottomField);
+            updateImageCountField();
+
+            traySlotBox.addActionListener(new ActionListener({
+                actionPerformed: function(event) {
+                    try {
+                        saveTrayFields(currentTraySlot);
+                        currentTraySlot = selectedOneBasedIndex(traySlotBox);
+                        loadTrayFields(currentTraySlot);
+                        showJogControls('Jog Top camera', trayStartJogDetail, xLeftField, yTopField, true, updateTrayFieldsFromCamera);
+                    }
+                    catch (error) {
+                        JOptionPane.showMessageDialog(
+                            null,
+                            String(error.message || error),
+                            'Could not switch sorting tray',
+                            JOptionPane.ERROR_MESSAGE
+                        );
+                        traySlotBox.setSelectedIndex(currentTraySlot - 1);
+                    }
+                }
+            }));
+            plateSlotBox.addActionListener(new ActionListener({
+                actionPerformed: function(event) {
+                    try {
+                        savePlateFields(currentPlateSlot);
+                        currentPlateSlot = selectedOneBasedIndex(plateSlotBox);
+                        loadPlateFields(currentPlateSlot);
+                        showJogControls('Jog picker', plateA1JogDetail, plateA1XField, plateA1YField, false, null, nozzle, calibrationTravelZ, 'picker');
+                    }
+                    catch (error) {
+                        JOptionPane.showMessageDialog(
+                            null,
+                            String(error.message || error),
+                            'Could not switch plate',
+                            JOptionPane.ERROR_MESSAGE
+                        );
+                        plateSlotBox.setSelectedIndex(currentPlateSlot - 1);
+                    }
+                }
+            }));
+            recoverySlotBox.addActionListener(new ActionListener({
+                actionPerformed: function(event) {
+                    try {
+                        saveRecoveryFields(currentRecoverySlot);
+                        currentRecoverySlot = selectedOneBasedIndex(recoverySlotBox);
+                        loadRecoveryFields(currentRecoverySlot);
+                        showJogControls('Jog picker', recoveryA1JogDetail, recoveryPlateA1XField, recoveryPlateA1YField, false, null, nozzle, calibrationTravelZ, 'picker');
+                    }
+                    catch (error) {
+                        JOptionPane.showMessageDialog(
+                            null,
+                            String(error.message || error),
+                            'Could not switch recovery plate',
+                            JOptionPane.ERROR_MESSAGE
+                        );
+                        recoverySlotBox.setSelectedIndex(currentRecoverySlot - 1);
+                    }
                 }
             }));
 
@@ -560,12 +1716,65 @@ with (imports) {
                     }
                 }
             }));
+            plateQaCameraA1MoveButton.addActionListener(new ActionListener({
+                actionPerformed: function(event) {
+                    try {
+                        commandHiResToPlateQaA1(nozzle, plateQaCameraA1XField, plateQaCameraA1YField, hiResFocusZField, hiResCalibrationTravelZ);
+                    }
+                    catch (error) {
+                        JOptionPane.showMessageDialog(
+                            null,
+                            String(error.message || error),
+                            'Could not move camera',
+                            JOptionPane.ERROR_MESSAGE
+                        );
+                    }
+                }
+            }));
+            recoveryPlateA1XyButton.addActionListener(new ActionListener({
+                actionPerformed: function(event) {
+                    try {
+                        commandPickerToRecoveryPlateA1Xy(nozzle, recoveryPlateA1XField, recoveryPlateA1YField, calibrationTravelZ);
+                    }
+                    catch (error) {
+                        JOptionPane.showMessageDialog(
+                            null,
+                            String(error.message || error),
+                            'Could not move picker',
+                            JOptionPane.ERROR_MESSAGE
+                        );
+                    }
+                }
+            }));
+            recoveryPlateA1ZButton.addActionListener(new ActionListener({
+                actionPerformed: function(event) {
+                    try {
+                        commandPickerToRecoveryPlateA1Z(nozzle, calibrationTravelZ);
+                    }
+                    catch (error) {
+                        JOptionPane.showMessageDialog(
+                            null,
+                            String(error.message || error),
+                            'Could not move picker',
+                            JOptionPane.ERROR_MESSAGE
+                        );
+                    }
+                }
+            }));
 
-            panel.add(startPanel);
-            panel.add(endPanel);
-            panel.add(heightPanel);
-            panel.add(platePanel);
-            panel.add(runPanel);
+            calibrationPanel.add(startPanel);
+            calibrationPanel.add(endPanel);
+            calibrationPanel.add(heightPanel);
+            calibrationPanel.add(platePanel);
+            calibrationPanel.add(recoveryPlatePanel);
+
+            var scrollPane = new Packages.javax.swing.JScrollPane(calibrationPanel);
+            scrollPane.setPreferredSize(new Packages.java.awt.Dimension(880, 720));
+            scrollPane.setVerticalScrollBarPolicy(Packages.javax.swing.ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED);
+            scrollPane.setHorizontalScrollBarPolicy(Packages.javax.swing.ScrollPaneConstants.HORIZONTAL_SCROLLBAR_AS_NEEDED);
+            panel.add(scrollPane, BorderLayout.CENTER);
+            panel.add(jogDock, BorderLayout.EAST);
+            showJogControls('Jog Top camera', trayStartJogDetail, xLeftField, yTopField, true, updateTrayFieldsFromCamera);
 
             var result = JOptionPane.showConfirmDialog(
                 null,
@@ -579,28 +1788,43 @@ with (imports) {
             }
 
             try {
+                saveTrayFields(currentTraySlot);
+                savePlateFields(currentPlateSlot);
+                saveRecoveryFields(currentRecoverySlot);
+                var dialogMultiConfig = activeMultiConfig();
+                var primaryTrayConfig = multiSlotByNumber(dialogMultiConfig.sorting_trays, 'tray_slot', 1);
+                var primaryPlateConfig = multiSlotByNumber(dialogMultiConfig.plates, 'plate_slot', 1);
+                var primaryRecoveryConfig = multiSlotByNumber(dialogMultiConfig.recovery_plates, 'recovery_slot', 1);
+                var primaryEventConfig = multiSlotByNumber(dialogMultiConfig.collection_events, 'event_slot', 1);
                 var updated = {
-                    xLeft: numberFieldValue(xLeftField, 'x_left_mm'),
-                    xRight: numberFieldValue(xRightField, 'x_right_mm'),
-                    yTop: numberFieldValue(yTopField, 'y_top_mm'),
-                    yBottom: numberFieldValue(yBottomField, 'y_bottom_mm'),
+                    xLeft: Number(primaryTrayConfig.x_left_mm),
+                    xRight: Number(primaryTrayConfig.x_right_mm),
+                    yTop: Number(primaryTrayConfig.y_top_mm),
+                    yBottom: Number(primaryTrayConfig.y_bottom_mm),
                     cameraXOffsetMm: calibration.cameraXOffsetMm,
                     cameraYOffsetMm: calibration.cameraYOffsetMm,
                     scanBoundsAreCameraCoordinates: calibration.scanBoundsAreCameraCoordinates,
                     xStepMm: calibration.xStepMm,
                     yStepMm: calibration.yStepMm,
-                    trayHeightMm: numberFieldValue(trayHeightField, 'tray_height_mm'),
-                    sizeClass: String(sizeClassField.getText()).trim(),
-                    pickZMm: numberFieldValue(pickZField, 'pick_z_mm'),
-                    plateA1X: numberFieldValue(plateA1XField, 'plate_a1_x_mm'),
-                    plateA1Y: numberFieldValue(plateA1YField, 'plate_a1_y_mm'),
+                    trayHeightMm: Number(primaryTrayConfig.tray_height_mm),
+                    sizeClass: String(primaryTrayConfig.size_class || '').trim(),
+                    pickZMm: Number(primaryTrayConfig.pick_z_mm),
+                    plateA1X: Number(primaryPlateConfig.plate_a1_x_mm),
+                    plateA1Y: Number(primaryPlateConfig.plate_a1_y_mm),
+                    plateQaCameraA1X: Number(primaryPlateConfig.plate_qa_camera_a1_x_mm),
+                    plateQaCameraA1Y: Number(primaryPlateConfig.plate_qa_camera_a1_y_mm),
+                    hiResTrayOffsetX: Number(primaryPlateConfig.plate_qa_camera_a1_x_mm) - Number(primaryPlateConfig.plate_a1_x_mm),
+                    hiResTrayOffsetY: Number(primaryPlateConfig.plate_qa_camera_a1_y_mm) - Number(primaryPlateConfig.plate_a1_y_mm),
+                    hiResFocusZMm: numberFieldValue(hiResFocusZField, 'hires_focus_z_mm'),
+                    recoveryPlateA1X: Number(primaryRecoveryConfig.recovery_plate_a1_x_mm),
+                    recoveryPlateA1Y: Number(primaryRecoveryConfig.recovery_plate_a1_y_mm),
                     plateWellPitchMm: numberFieldValue(platePitchField, 'plate_well_pitch_mm'),
                     source: calibration.source
                 };
-                var plateNumber = normalizePlateNumber(plateNumberField.getText());
-                var startWell = normalizeWellName(startWellField.getText());
+                var plateNumber = normalizePlateNumber(primaryPlateConfig.plate_number);
+                var startWell = normalizeWellName(primaryPlateConfig.start_well);
                 var plateId = 'P-' + plateNumber;
-                var collectionCode = String(collectionCodeField.getText()).trim();
+                var collectionCode = String(primaryEventConfig ? primaryEventConfig.collection_code || '' : '').trim();
 
                 if (updated.xLeft === updated.xRight || updated.yTop === updated.yBottom) {
                     throw new Error('Tray scan bounds must span a non-zero X and Y range.');
@@ -624,27 +1848,89 @@ with (imports) {
                     updated.yTop = updated.yBottom;
                     updated.yBottom = swapY;
                 }
+                var multiConfig = calibration.multiConfig
+                    ? clonePlainObject(calibration.multiConfig)
+                    : defaultMultiTrayCalibration(updated);
+                multiConfig.shared.camera_x_offset_mm = updated.cameraXOffsetMm;
+                multiConfig.shared.camera_y_offset_mm = updated.cameraYOffsetMm;
+                multiConfig.shared.scan_bounds_are_camera_coordinates = updated.scanBoundsAreCameraCoordinates;
+                multiConfig.shared.x_step_mm = updated.xStepMm;
+                multiConfig.shared.y_step_mm = updated.yStepMm;
+                multiConfig.shared.plate_well_pitch_mm = updated.plateWellPitchMm;
+                multiConfig.shared.hires_tray_offset_x_mm = updated.hiResTrayOffsetX;
+                multiConfig.shared.hires_tray_offset_y_mm = updated.hiResTrayOffsetY;
+                multiConfig.shared.hires_focus_z_mm = updated.hiResFocusZMm;
+                var primaryTray = multiSlotByNumber(multiConfig.sorting_trays, 'tray_slot', 1);
+                if (primaryTray) {
+                    primaryTray.enabled = true;
+                    primaryTray.x_left_mm = updated.xLeft;
+                    primaryTray.x_right_mm = updated.xRight;
+                    primaryTray.y_top_mm = updated.yTop;
+                    primaryTray.y_bottom_mm = updated.yBottom;
+                    primaryTray.tray_height_mm = updated.trayHeightMm;
+                    primaryTray.size_class = updated.sizeClass;
+                    primaryTray.pick_z_mm = updated.pickZMm;
+                }
+                var primaryPlate = multiSlotByNumber(multiConfig.plates, 'plate_slot', 1);
+                if (primaryPlate) {
+                    primaryPlate.enabled = true;
+                    primaryPlate.plate_number = plateNumber;
+                    primaryPlate.start_well = startWell;
+                    primaryPlate.plate_a1_x_mm = updated.plateA1X;
+                    primaryPlate.plate_a1_y_mm = updated.plateA1Y;
+                    primaryPlate.plate_qa_camera_a1_x_mm = updated.plateQaCameraA1X;
+                    primaryPlate.plate_qa_camera_a1_y_mm = updated.plateQaCameraA1Y;
+                }
+                var primaryRecovery = multiSlotByNumber(multiConfig.recovery_plates, 'recovery_slot', 1);
+                if (primaryRecovery) {
+                    primaryRecovery.enabled = true;
+                    primaryRecovery.recovery_plate_a1_x_mm = updated.recoveryPlateA1X;
+                    primaryRecovery.recovery_plate_a1_y_mm = updated.recoveryPlateA1Y;
+                }
+                var primaryEvent = multiSlotByNumber(multiConfig.collection_events, 'event_slot', 1);
+                if (primaryEvent) {
+                    primaryEvent.enabled = true;
+                    primaryEvent.collection_code = collectionCode;
+                    primaryEvent.plate_slot = 1;
+                    primaryEvent.recovery_slot = 1;
+                }
+                multiConfig.active_collection_event_count = Math.max(1, Number(multiConfig.active_collection_event_count || 1));
+                multiConfig.active_sorting_tray_count = Math.max(1, Number(multiConfig.active_sorting_tray_count || 1));
+                multiConfig.active_plate_count = Math.max(1, Number(multiConfig.active_plate_count || 1));
+                multiConfig.active_recovery_plate_count = Math.max(1, Number(multiConfig.active_recovery_plate_count || 1));
+                updated.multiConfig = multiConfig;
 
                 if (plateCsvFile(plateNumber).exists()) {
-                    var continueResult = JOptionPane.showConfirmDialog(
+                    var recordedWells = occupiedWellCount(plateNumber);
+                    var plateChoice = JOptionPane.showOptionDialog(
                         null,
                         'A spreadsheet already exists for plate ' + plateNumber
-                            + '. Continue plating onto this existing plate and editing its CSV?',
+                            + ' with ' + recordedWells + ' recorded well(s).'
+                            + '\n\nContinue from the next unrecorded well, or archive the old CSV and treat this as a fresh plate?',
                         'Existing plate warning',
-                        JOptionPane.YES_NO_OPTION,
-                        JOptionPane.WARNING_MESSAGE
+                        JOptionPane.YES_NO_CANCEL_OPTION,
+                        JOptionPane.WARNING_MESSAGE,
+                        null,
+                        Java.to(['Continue existing plate', 'Archive and restart plate', 'Cancel'], 'java.lang.Object[]'),
+                        'Continue existing plate'
                     );
-                    if (continueResult !== JOptionPane.YES_OPTION) {
-                        throw new Error('Choose a new plate number or confirm that this is an existing plate.');
+                    if (plateChoice === 1) {
+                        archivePlateSpreadsheet(plateNumber);
+                    }
+                    else if (plateChoice === 0) {
+                        reviewExistingPlateWells({
+                            plateNumber: plateNumber,
+                            plateId: plateId,
+                            collectionCode: collectionCode,
+                            startWell: startWell
+                        });
+                    }
+                    else {
+                        throw new Error('Choose a new plate number, continue the existing plate, or archive the old CSV.');
                     }
                 }
                 writeTrainingTrayCalibration(updated);
-                updated.plateContext = {
-                    plateNumber: plateNumber,
-                    plateId: plateId,
-                    collectionCode: collectionCode,
-                    startWell: startWell
-                };
+                updated.plateContext = plateContextForSlot(updated.multiConfig, 1);
                 return updated;
             }
             catch (validationError) {
@@ -692,6 +1978,12 @@ with (imports) {
         return dir;
     }
 
+    function plateAuditRoot() {
+        var dir = new File(projectDir, 'Plate_audits');
+        dir.mkdirs();
+        return dir;
+    }
+
     function normalizePlateNumber(text) {
         var value = String(text || '').trim().toUpperCase();
         value = value.replace(/[^A-Z0-9_-]/g, '');
@@ -717,6 +2009,18 @@ with (imports) {
         return (rowIndex * 12) + columnIndex;
     }
 
+    var RESERVED_NEGATIVE_CONTROL_WELL = 'H12';
+    var RESERVED_NEGATIVE_CONTROL_WELL_INDEX = wellIndexForName(RESERVED_NEGATIVE_CONTROL_WELL);
+    var PLATE_FILLABLE_WELL_COUNT = 95;
+
+    function isReservedPlateWellName(wellName) {
+        return normalizeWellName(wellName) === RESERVED_NEGATIVE_CONTROL_WELL;
+    }
+
+    function isReservedPlateWellIndex(wellIndex) {
+        return Number(wellIndex) === RESERVED_NEGATIVE_CONTROL_WELL_INDEX;
+    }
+
     function plateCsvFile(plateNumber) {
         return new File(plateSpreadsheetRoot(), normalizePlateNumber(plateNumber) + '.csv');
     }
@@ -728,17 +2032,26 @@ with (imports) {
             'Plate ID',
             'Well Number',
             'Extract ID',
-            'Collection Code',
             'Image Code',
+            'Project',
+            'Collection Code',
             'Order',
-            'Current Status',
+            'Notes',
             'DNA concentration (ng/\u00b5l)',
             'Extract volume (\u00b5l)',
             'quantified volume',
             'Vol remaining',
             'Gel Results',
             'COI, ONT Sequencing Results',
-            'Link to ELN PCR page'
+            'Link to ELN PCR page',
+            'Scan ID',
+            'Target Number',
+            'Object Index',
+            'Source Scan Image',
+            'HiRes Image',
+            'Bottom Image',
+            'Well Image',
+            'Plating Confirmation'
         ];
     }
 
@@ -793,11 +2106,18 @@ with (imports) {
         return values;
     }
 
+    function normalizeCsvHeaderName(text) {
+        return String(text || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
+    }
+
     function readPlateRows(plateNumber) {
         var file = plateCsvFile(plateNumber);
-        var rows = [];
+        var result = {
+            headers: [],
+            rows: []
+        };
         if (!file.exists()) {
-            return rows;
+            return result;
         }
 
         var reader = new BufferedReader(new FileReader(file));
@@ -807,9 +2127,10 @@ with (imports) {
             while (line !== null) {
                 if (first) {
                     first = false;
+                    result.headers = splitCsvLine(String(line));
                 }
                 else if (String(line).trim().length > 0) {
-                    rows.push(splitCsvLine(String(line)));
+                    result.rows.push(splitCsvLine(String(line)));
                 }
                 line = reader.readLine();
             }
@@ -817,37 +2138,895 @@ with (imports) {
         finally {
             reader.close();
         }
-        return rows;
+        return result;
+    }
+
+    function plateRowsOnly(plateNumber) {
+        return readPlateRows(plateNumber).rows;
+    }
+
+    function plateWellColumnIndex(plateData) {
+        for (var i = 0; i < plateData.headers.length; i++) {
+            var normalized = normalizeCsvHeaderName(plateData.headers[i]);
+            if (normalized === 'wellnumber' || normalized === 'well' || normalized === 'wellname') {
+                return i;
+            }
+        }
+        return 3;
+    }
+
+    function plateCurrentStatusColumnIndex(plateData) {
+        for (var i = 0; i < plateData.headers.length; i++) {
+            var normalized = normalizeCsvHeaderName(plateData.headers[i]);
+            if (normalized === 'currentstatus' || normalized === 'status' || normalized === 'notes') {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    function plateHeaderIndex(headers, headerName) {
+        var normalizedName = normalizeCsvHeaderName(headerName);
+        for (var i = 0; i < headers.length; i++) {
+            if (normalizeCsvHeaderName(headers[i]) === normalizedName) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    function plateRowValueByHeader(headers, row, headerName) {
+        var index = plateHeaderIndex(headers, headerName);
+        if (index < 0 || row.length <= index) {
+            return '';
+        }
+        return row[index];
+    }
+
+    function setPlateRowValueByHeader(headers, row, headerName, value) {
+        var index = plateHeaderIndex(headers, headerName);
+        if (index < 0) {
+            return;
+        }
+        while (row.length <= index) {
+            row.push('');
+        }
+        row[index] = value === null || value === undefined ? '' : String(value);
+    }
+
+    function applyPlateTraceMetadata(headers, row, metadata) {
+        if (!metadata) {
+            return;
+        }
+        setPlateRowValueByHeader(headers, row, 'Scan ID', metadata.scanId || '');
+        setPlateRowValueByHeader(headers, row, 'Target Number', metadata.targetNumber || '');
+        setPlateRowValueByHeader(headers, row, 'Object Index', metadata.objectIndex || '');
+        setPlateRowValueByHeader(headers, row, 'Source Scan Image', metadata.sourceScanImage || '');
+        setPlateRowValueByHeader(headers, row, 'HiRes Image', metadata.hiResImage || '');
+        setPlateRowValueByHeader(headers, row, 'Bottom Image', metadata.bottomImage || '');
+        setPlateRowValueByHeader(headers, row, 'Well Image', metadata.wellImage || '');
+        setPlateRowValueByHeader(headers, row, 'Plating Confirmation', metadata.confirmation || '');
+    }
+
+    function plateRowForHeaders(sourceHeaders, sourceRow, targetHeaders) {
+        var row = [];
+        for (var i = 0; i < targetHeaders.length; i++) {
+            var header = targetHeaders[i];
+            var value = plateRowValueByHeader(sourceHeaders, sourceRow, header);
+            if (header === 'Project' && String(value || '').trim().length === 0) {
+                value = 'CIB';
+            }
+            else if (header === 'Notes' && String(value || '').trim().length === 0) {
+                value = plateRowValueByHeader(sourceHeaders, sourceRow, 'Current Status');
+            }
+            row.push(value);
+        }
+        return row;
+    }
+
+    function plateExtractIdColumnIndex(plateData) {
+        for (var i = 0; i < plateData.headers.length; i++) {
+            var normalized = normalizeCsvHeaderName(plateData.headers[i]);
+            if (normalized === 'extractid' || normalized === 'fieldid' || normalized === 'specimenid') {
+                return i;
+            }
+        }
+        return 4;
+    }
+
+    function rowMarksWellUnavailable(row, statusColumnIndex) {
+        if (statusColumnIndex < 0 || row.length <= statusColumnIndex) {
+            return false;
+        }
+        var status = normalizeCsvHeaderName(row[statusColumnIndex]);
+        return status === 'empty'
+            || status === 'emptyaftermanualreview'
+            || status === 'unfilled'
+            || status === 'failed'
+            || status === 'failedpick'
+            || status === 'failedplace'
+            || status === 'ignore'
+            || status === 'available';
+    }
+
+    function plateNumberColumnIndex(plateData) {
+        for (var i = 0; i < plateData.headers.length; i++) {
+            var normalized = normalizeCsvHeaderName(plateData.headers[i]);
+            if (normalized === 'no' || normalized === 'number' || normalized === 'row') {
+                return i;
+            }
+        }
+        return 0;
+    }
+
+    function sortPlateSpreadsheetRows(plateNumber) {
+        var file = plateCsvFile(plateNumber);
+        if (!file.exists()) {
+            return;
+        }
+
+        var plateData = readPlateRows(plateNumber);
+        if (plateData.rows.length <= 1) {
+            return;
+        }
+
+        var wellColumnIndex = plateWellColumnIndex(plateData);
+        var numberColumnIndex = plateNumberColumnIndex(plateData);
+        var rows = plateData.rows.slice(0);
+        rows.sort(function(left, right) {
+            var leftIndex = 9999;
+            var rightIndex = 9999;
+            try {
+                if (left.length > wellColumnIndex && left[wellColumnIndex]) {
+                    leftIndex = wellIndexForName(left[wellColumnIndex]);
+                }
+            }
+            catch (leftError) {
+                leftIndex = 9999;
+            }
+            try {
+                if (right.length > wellColumnIndex && right[wellColumnIndex]) {
+                    rightIndex = wellIndexForName(right[wellColumnIndex]);
+                }
+            }
+            catch (rightError) {
+                rightIndex = 9999;
+            }
+            if (leftIndex !== rightIndex) {
+                return leftIndex - rightIndex;
+            }
+            return 0;
+        });
+
+        var output = csvLine(plateData.headers.length > 0 ? plateData.headers : plateCsvHeaders());
+        for (var i = 0; i < rows.length; i++) {
+            if (numberColumnIndex >= 0) {
+                while (rows[i].length <= numberColumnIndex) {
+                    rows[i].push('');
+                }
+                rows[i][numberColumnIndex] = String(i + 1);
+            }
+            output += csvLine(rows[i]);
+        }
+        writeText(file, output);
+        print('Sorted plate spreadsheet by well order: ' + file.getAbsolutePath());
+    }
+
+    function plateHeadersMatchExpected(headers) {
+        var expected = plateCsvHeaders();
+        if (headers.length !== expected.length) {
+            return false;
+        }
+        for (var i = 0; i < expected.length; i++) {
+            if (String(headers[i]) !== String(expected[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    function migratePlateSpreadsheetColumns(plateNumber) {
+        var file = plateCsvFile(plateNumber);
+        if (!file.exists()) {
+            return;
+        }
+        var plateData = readPlateRows(plateNumber);
+        var expectedHeaders = plateCsvHeaders();
+        if (plateHeadersMatchExpected(plateData.headers)) {
+            return;
+        }
+        var output = csvLine(expectedHeaders);
+        for (var i = 0; i < plateData.rows.length; i++) {
+            output += csvLine(plateRowForHeaders(plateData.headers, plateData.rows[i], expectedHeaders));
+        }
+        writeText(file, output);
+        sortPlateSpreadsheetRows(plateNumber);
+        print('Migrated plate spreadsheet columns to current format: ' + file.getAbsolutePath());
     }
 
     function occupiedWellSet(plateNumber) {
-        var rows = readPlateRows(plateNumber);
+        var plateData = readPlateRows(plateNumber);
+        var rows = plateData.rows;
+        var wellColumnIndex = plateWellColumnIndex(plateData);
+        var statusColumnIndex = plateCurrentStatusColumnIndex(plateData);
         var occupied = {};
         for (var i = 0; i < rows.length; i++) {
-            if (rows[i].length >= 4 && rows[i][3]) {
-                occupied[normalizeWellName(rows[i][3])] = true;
+            if (rowMarksWellUnavailable(rows[i], statusColumnIndex)) {
+                continue;
+            }
+            if (rows[i].length > wellColumnIndex && rows[i][wellColumnIndex]) {
+                try {
+                    occupied[normalizeWellName(rows[i][wellColumnIndex])] = true;
+                }
+                catch (wellError) {
+                    print('Ignoring invalid well value in plate CSV row ' + (i + 2)
+                        + ': ' + rows[i][wellColumnIndex]);
+                }
             }
         }
         return occupied;
+    }
+
+    function occupiedWellCount(plateNumber) {
+        var occupied = occupiedWellSet(plateNumber);
+        var count = 0;
+        for (var wellName in occupied) {
+            if (occupied.hasOwnProperty(wellName)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    function isPlateCompletelyFilled(plateNumber) {
+        return occupiedWellCount(plateNumber) >= PLATE_FILLABLE_WELL_COUNT;
+    }
+
+    function plateRowForWell(plateContext, wellName, status, metadata) {
+        var plateNumber = normalizePlateNumber(plateContext.plateNumber);
+        metadata = metadata || {};
+        return [
+            '',
+            plateNumber,
+            plateContext.plateId,
+            wellName,
+            'DNA-' + plateNumber + '-' + wellName,
+            imageCodeForWell(plateNumber, wellName),
+            'CIB',
+            plateContext.collectionCode,
+            '',
+            status || '',
+            '',
+            '',
+            '',
+            '',
+            '',
+            '',
+            '',
+            metadata.scanId || '',
+            metadata.targetNumber || '',
+            metadata.objectIndex || '',
+            metadata.sourceScanImage || '',
+            metadata.hiResImage || '',
+            metadata.bottomImage || '',
+            metadata.wellImage || '',
+            metadata.confirmation || ''
+        ];
+    }
+
+    function wellReviewStateForPlate(plateContext) {
+        var plateData = readPlateRows(plateContext.plateNumber);
+        var wellColumnIndex = plateWellColumnIndex(plateData);
+        var statusColumnIndex = plateCurrentStatusColumnIndex(plateData);
+        var extractColumnIndex = plateExtractIdColumnIndex(plateData);
+        var startIndex = wellIndexForName(plateContext.startWell);
+        var byWell = {};
+
+        for (var i = 0; i < plateData.rows.length; i++) {
+            var row = plateData.rows[i];
+            if (row.length <= wellColumnIndex || !row[wellColumnIndex]) {
+                continue;
+            }
+            try {
+                var wellName = normalizeWellName(row[wellColumnIndex]);
+                if (!byWell[wellName]) {
+                    byWell[wellName] = {
+                        occupied: !rowMarksWellUnavailable(row, statusColumnIndex),
+                        fieldId: row.length > extractColumnIndex ? String(row[extractColumnIndex] || '') : ''
+                    };
+                }
+            }
+            catch (wellError) {
+                print('Ignoring invalid well value during plate review: ' + row[wellColumnIndex]);
+            }
+        }
+
+        var states = {};
+        for (var index = 0; index < 96; index++) {
+            var name = wellNameForIndex(index);
+            var existing = byWell[name];
+            var occupied = existing ? Boolean(existing.occupied) : false;
+            states[name] = {
+                index: index,
+                name: name,
+                enabled: !isReservedPlateWellIndex(index),
+                inRunRange: index >= startIndex && !isReservedPlateWellIndex(index),
+                occupied: occupied,
+                originalOccupied: occupied,
+                fieldId: existing ? existing.fieldId : ''
+            };
+        }
+        return states;
+    }
+
+    function syncPlateReviewStateToCsv(plateContext, states) {
+        ensurePlateSpreadsheetHeader(plateContext);
+        var plateData = readPlateRows(plateContext.plateNumber);
+        var headers = plateData.headers.length > 0 ? plateData.headers : plateCsvHeaders();
+        var wellColumnIndex = plateWellColumnIndex({ headers: headers, rows: plateData.rows });
+        var statusColumnIndex = plateCurrentStatusColumnIndex({ headers: headers, rows: plateData.rows });
+        var numberColumnIndex = plateNumberColumnIndex({ headers: headers, rows: plateData.rows });
+        var rows = plateData.rows.slice(0);
+        var rowByWell = {};
+
+        if (statusColumnIndex < 0) {
+            headers.push('Notes');
+            statusColumnIndex = headers.length - 1;
+        }
+
+        for (var i = 0; i < rows.length; i++) {
+            var row = rows[i];
+            if (row.length <= wellColumnIndex || !row[wellColumnIndex]) {
+                continue;
+            }
+            try {
+                var wellName = normalizeWellName(row[wellColumnIndex]);
+                if (!rowByWell[wellName]) {
+                    rowByWell[wellName] = row;
+                }
+            }
+            catch (wellError) {
+                print('Ignoring invalid well value while syncing plate review: ' + row[wellColumnIndex]);
+            }
+        }
+
+        for (var index = 0; index < 96; index++) {
+            var name = wellNameForIndex(index);
+            if (isReservedPlateWellIndex(index) || !states[name]) {
+                continue;
+            }
+            var state = states[name];
+            var existingRow = rowByWell[name];
+            if (existingRow) {
+                while (existingRow.length <= statusColumnIndex) {
+                    existingRow.push('');
+                }
+                existingRow[statusColumnIndex] = state.occupied
+                    ? ''
+                    : state.originalOccupied
+                    ? 'empty after manual review'
+                    : 'empty';
+            }
+            else if (state.occupied) {
+                var newRow = plateRowForWell(plateContext, name, 'occupied');
+                rows.push(newRow);
+                rowByWell[name] = newRow;
+            }
+        }
+
+        rows.sort(function(left, right) {
+            var leftIndex = 9999;
+            var rightIndex = 9999;
+            try {
+                if (left.length > wellColumnIndex && left[wellColumnIndex]) {
+                    leftIndex = wellIndexForName(left[wellColumnIndex]);
+                }
+            }
+            catch (leftError) {
+                leftIndex = 9999;
+            }
+            try {
+                if (right.length > wellColumnIndex && right[wellColumnIndex]) {
+                    rightIndex = wellIndexForName(right[wellColumnIndex]);
+                }
+            }
+            catch (rightError) {
+                rightIndex = 9999;
+            }
+            return leftIndex - rightIndex;
+        });
+
+        var output = csvLine(headers);
+        for (var rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+            if (numberColumnIndex >= 0) {
+                while (rows[rowIndex].length <= numberColumnIndex) {
+                    rows[rowIndex].push('');
+                }
+                rows[rowIndex][numberColumnIndex] = String(rowIndex + 1);
+            }
+            output += csvLine(rows[rowIndex]);
+        }
+        writeText(plateCsvFile(plateContext.plateNumber), output);
+        sortPlateSpreadsheetRows(plateContext.plateNumber);
+        print('Updated plate CSV from well review: ' + plateCsvFile(plateContext.plateNumber).getAbsolutePath());
+    }
+
+    function reviewExistingPlateWells(plateContext) {
+        var ActionListener = Packages.java.awt.event.ActionListener;
+        var states = wellReviewStateForPlate(plateContext);
+        var occupiedColor = new Color(190, 45, 45);
+        var availableColor = new Color(38, 150, 86);
+        var unavailableColor = new Color(130, 130, 130);
+        var textColor = Color.WHITE;
+        var buttons = {};
+
+        function updateButton(name) {
+            var button = buttons[name];
+            var state = states[name];
+            if (!button || !state) {
+                return;
+            }
+            var label = '<html><center>' + state.name;
+            if (state.fieldId && state.fieldId.length > 0) {
+                label += '<br><font size="-2">' + state.fieldId + '</font>';
+            }
+            else {
+                label += '<br><font size="-2">&nbsp;</font>';
+            }
+            label += '</center></html>';
+            button.setText(label);
+            button.setOpaque(true);
+            button.setBorderPainted(true);
+            button.setForeground(textColor);
+            var isAvailableThisRun = state.enabled && state.inRunRange && !state.occupied;
+            button.setBackground(state.occupied ? occupiedColor : isAvailableThisRun ? availableColor : unavailableColor);
+            button.setToolTipText(
+                state.enabled
+                    ? (state.name + (state.occupied
+                        ? ' marked occupied; click to make available'
+                        : state.inRunRange
+                        ? ' marked available for this run; click to make occupied'
+                        : ' before starting well; click to make occupied'))
+                    : (state.name + ' reserved negative control')
+            );
+        }
+
+        var panel = new JPanel(new BorderLayout(10, 10));
+        panel.add(
+            new JLabel(
+                '<html>Verify plate ' + plateContext.plateNumber
+                    + '. Red wells are treated as occupied. Green wells are available for this run. '
+                    + 'Click any well to toggle. ' + RESERVED_NEGATIVE_CONTROL_WELL
+                    + ' remains reserved.</html>'
+            ),
+            BorderLayout.NORTH
+        );
+
+        var grid = new JPanel(new GridLayout(8, 12, 4, 4));
+        for (var row = 0; row < 8; row++) {
+            for (var column = 0; column < 12; column++) {
+                var wellIndex = (row * 12) + column;
+                var wellName = wellNameForIndex(wellIndex);
+                var button = new JButton();
+                button.setPreferredSize(new Dimension(82, 58));
+                button.setEnabled(!isReservedPlateWellIndex(wellIndex));
+                buttons[wellName] = button;
+                updateButton(wellName);
+                button.addActionListener(new ActionListener({
+                    actionPerformed: (function(name) {
+                        return function(event) {
+                            states[name].occupied = !states[name].occupied;
+                            updateButton(name);
+                        };
+                    })(wellName)
+                }));
+                grid.add(button);
+            }
+        }
+
+        var legend = new JPanel(new GridLayout(1, 3, 8, 4));
+        var redLabel = new JLabel('Red: occupied / skip');
+        redLabel.setOpaque(true);
+        redLabel.setBackground(occupiedColor);
+        redLabel.setForeground(textColor);
+        var greenLabel = new JLabel('Green: empty / available');
+        greenLabel.setOpaque(true);
+        greenLabel.setBackground(availableColor);
+        greenLabel.setForeground(textColor);
+        var grayLabel = new JLabel('Gray: reserved / before start');
+        grayLabel.setOpaque(true);
+        grayLabel.setBackground(unavailableColor);
+        grayLabel.setForeground(textColor);
+        legend.add(redLabel);
+        legend.add(greenLabel);
+        legend.add(grayLabel);
+
+        var center = new JPanel(new BorderLayout(0, 8));
+        center.add(grid, BorderLayout.CENTER);
+        center.add(legend, BorderLayout.SOUTH);
+        panel.add(center, BorderLayout.CENTER);
+
+        var result = JOptionPane.showConfirmDialog(
+            null,
+            panel,
+            'Review plate wells',
+            JOptionPane.OK_CANCEL_OPTION,
+            JOptionPane.QUESTION_MESSAGE
+        );
+        if (result !== JOptionPane.OK_OPTION) {
+            throw new Error('Plate well review was cancelled.');
+        }
+        syncPlateReviewStateToCsv(plateContext, states);
+    }
+
+    function archivePlateSpreadsheet(plateNumber) {
+        var file = plateCsvFile(plateNumber);
+        if (!file.exists()) {
+            return null;
+        }
+
+        var normalizedPlateNumber = normalizePlateNumber(plateNumber);
+        var archive = new File(
+            plateSpreadsheetRoot(),
+            normalizedPlateNumber + '.archived_' + timestamp() + '.csv'
+        );
+        Packages.java.nio.file.Files.move(
+            file.toPath(),
+            archive.toPath(),
+            Packages.java.nio.file.StandardCopyOption.REPLACE_EXISTING
+        );
+        print('Archived plate spreadsheet ' + file.getAbsolutePath()
+            + ' to ' + archive.getAbsolutePath());
+        return archive;
     }
 
     function imageCodeForWell(plateNumber, wellName) {
         return 'IMG-DNA-' + normalizePlateNumber(plateNumber) + '-' + normalizeWellName(wellName);
     }
 
-    function copyPlateWellImage(plateContext, well, sourceImageFile) {
+    function plateImageFolder(plateNumber) {
+        var dir = new File(plateImageRoot(), 'P-' + normalizePlateNumber(plateNumber));
+        dir.mkdirs();
+        return dir;
+    }
+
+    function copyImageFile(sourceImageFile, destination) {
         if (sourceImageFile === null || sourceImageFile === undefined || !sourceImageFile.exists()) {
             return null;
         }
-        var imageCode = imageCodeForWell(plateContext.plateNumber, well.name);
-        var destination = new File(plateImageRoot(), imageCode + '.png');
         Packages.java.nio.file.Files.copy(
             sourceImageFile.toPath(),
             destination.toPath(),
             Packages.java.nio.file.StandardCopyOption.REPLACE_EXISTING
         );
-        print('Copied plate well image to ' + destination.getAbsolutePath());
         return destination;
+    }
+
+    function copyPlateSpecimenImages(scanDir, plateContext, well, target, hiResImageFile, bottomImageFile, wellImageFile) {
+        var imageCode = imageCodeForWell(plateContext.plateNumber, well.name);
+        var destinationDir = plateImageFolder(plateContext.plateNumber);
+        var copied = 0;
+        if (copyImageFile(hiResImageFile, new File(destinationDir, imageCode + '_hires.png')) !== null) {
+            copied++;
+        }
+        if (copyImageFile(bottomImageFile, new File(destinationDir, imageCode + '_bottom.png')) !== null) {
+            copied++;
+        }
+        if (copyImageFile(wellImageFile, new File(destinationDir, imageCode + '_well.png')) !== null) {
+            copied++;
+        }
+        if (target !== null && target !== undefined && target.cropFile && String(target.cropFile).length > 0) {
+            var scanImageFile = new File(scanDir, String(target.cropFile));
+            if (copyImageFile(scanImageFile, new File(destinationDir, imageCode + '_scan.png')) !== null) {
+                copied++;
+            }
+        }
+        print('Copied ' + copied + ' plate review image(s) to ' + destinationDir.getAbsolutePath()
+            + ' for ' + imageCode);
+    }
+
+    function resolveAttemptImageFile(attempt, kind) {
+        if (!attempt || !attempt.scanDir) {
+            return null;
+        }
+        var scanDir = new File(String(attempt.scanDir));
+        var name = '';
+        var candidates = [];
+        if (kind === 'scan') {
+            name = String(attempt.sourceScanImage || '');
+            if (name.length > 0) {
+                candidates.push(new File(scanDir, name));
+            }
+        }
+        else if (kind === 'hires') {
+            name = String(attempt.hiResImage || '');
+            if (name.length > 0) {
+                candidates.push(new File(scanDir, 'hires/' + name));
+                candidates.push(new File(scanDir, name));
+            }
+        }
+        else if (kind === 'bottom') {
+            name = String(attempt.bottomImage || '');
+            if (name.length > 0) {
+                candidates.push(new File(scanDir, 'bottom_inspections/' + name));
+                candidates.push(new File(scanDir, name));
+            }
+        }
+        else if (kind === 'well') {
+            name = String(attempt.wellImage || '');
+            if (name.length > 0) {
+                candidates.push(new File(scanDir, 'qa/wells/' + name));
+                candidates.push(new File(scanDir, name));
+            }
+        }
+        for (var i = 0; i < candidates.length; i++) {
+            if (candidates[i].exists()) {
+                return candidates[i];
+            }
+        }
+        return null;
+    }
+
+    function latestPlateAttemptForWell(plateContext, wellName) {
+        var file = plateAttemptLogFile(plateContext);
+        if (!file.exists()) {
+            return null;
+        }
+        var normalizedPlate = normalizePlateNumber(plateContext.plateNumber);
+        var normalizedWell = normalizeWellName(wellName);
+        var latest = null;
+        var reader = new BufferedReader(new FileReader(file));
+        try {
+            var line = reader.readLine();
+            while (line !== null) {
+                var text = String(line || '').trim();
+                if (text.length > 0) {
+                    try {
+                        var attempt = JSON.parse(text);
+                        if (normalizePlateNumber(attempt.plate_number || normalizedPlate) === normalizedPlate
+                                && normalizeWellName(attempt.well || '') === normalizedWell
+                                && resolveAttemptImageFile(attempt, 'scan') !== null
+                                && resolveAttemptImageFile(attempt, 'hires') !== null
+                                && resolveAttemptImageFile(attempt, 'bottom') !== null
+                                && resolveAttemptImageFile(attempt, 'well') !== null) {
+                            latest = attempt;
+                        }
+                    }
+                    catch (attemptError) {
+                    }
+                }
+                line = reader.readLine();
+            }
+        }
+        finally {
+            reader.close();
+        }
+        return latest;
+    }
+
+    function copyPlateSpecimenImagesFromAttempt(plateContext, well, attempt) {
+        if (!attempt) {
+            return 0;
+        }
+        var imageCode = imageCodeForWell(plateContext.plateNumber, well.name);
+        var destinationDir = plateImageFolder(plateContext.plateNumber);
+        var copied = 0;
+        var kinds = ['scan', 'hires', 'bottom', 'well'];
+        for (var i = 0; i < kinds.length; i++) {
+            var kind = kinds[i];
+            var source = resolveAttemptImageFile(attempt, kind);
+            if (source !== null && copyImageFile(source, new File(destinationDir, imageCode + '_' + kind + '.png')) !== null) {
+                copied++;
+            }
+        }
+        print('Recovered ' + copied + ' review image(s) for manually occupied well '
+            + well.name + ' from latest plate attempt.');
+        return copied;
+    }
+
+    function plateTraceMetadataFromAttempt(attempt, confirmation) {
+        return {
+            scanId: attempt === null || attempt === undefined ? '' : String(attempt.scanId || ''),
+            targetNumber: attempt === null || attempt === undefined ? '' : attempt.targetNumber,
+            objectIndex: attempt === null || attempt === undefined ? '' : attempt.objectIndex,
+            sourceScanImage: attempt === null || attempt === undefined ? '' : String(attempt.sourceScanImage || ''),
+            hiResImage: attempt === null || attempt === undefined ? '' : String(attempt.hiResImage || ''),
+            bottomImage: attempt === null || attempt === undefined ? '' : String(attempt.bottomImage || ''),
+            wellImage: attempt === null || attempt === undefined ? '' : String(attempt.wellImage || ''),
+            confirmation: confirmation || 'manual occupied review recovered from latest attempt'
+        };
+    }
+
+    function latestPlateAuditFile(plateContext) {
+        return new File(plateAuditFolder(plateContext.plateNumber), 'plate_audit_latest.json');
+    }
+
+    function plateAuditFolder(plateNumber) {
+        var dir = new File(plateAuditRoot(), 'P-' + normalizePlateNumber(plateNumber));
+        dir.mkdirs();
+        return dir;
+    }
+
+    function runCompletedPlateAudit(plateContext, triggerScanId) {
+        var plateNumber = normalizePlateNumber(plateContext.plateNumber);
+        var plateData = readPlateRows(plateNumber);
+        var headers = plateData.headers.length > 0 ? plateData.headers : plateCsvHeaders();
+        var wellColumnIndex = plateWellColumnIndex({ headers: headers, rows: plateData.rows });
+        var statusColumnIndex = plateCurrentStatusColumnIndex({ headers: headers, rows: plateData.rows });
+        var imageDir = plateImageFolder(plateNumber);
+        var auditDir = plateAuditFolder(plateNumber);
+        var expectedImageKinds = ['scan', 'hires', 'bottom', 'well'];
+        var occupied = {};
+        var duplicateWells = [];
+        var invalidWellRows = [];
+        var missingRows = [];
+        var unavailableRows = [];
+        var missingImages = [];
+        var missingTraceMetadata = [];
+
+        for (var rowIndex = 0; rowIndex < plateData.rows.length; rowIndex++) {
+            var row = plateData.rows[rowIndex];
+            if (rowMarksWellUnavailable(row, statusColumnIndex)) {
+                unavailableRows.push(rowIndex + 2);
+                continue;
+            }
+            if (row.length <= wellColumnIndex || !row[wellColumnIndex]) {
+                missingRows.push(rowIndex + 2);
+                continue;
+            }
+            try {
+                var rowWell = normalizeWellName(row[wellColumnIndex]);
+                if (isReservedPlateWellName(rowWell)) {
+                    invalidWellRows.push({
+                        row: rowIndex + 2,
+                        well: rowWell,
+                        reason: 'reserved negative-control well'
+                    });
+                    continue;
+                }
+                if (occupied[rowWell]) {
+                    duplicateWells.push(rowWell);
+                }
+                occupied[rowWell] = true;
+            }
+            catch (wellError) {
+                invalidWellRows.push({
+                    row: rowIndex + 2,
+                    well: row.length > wellColumnIndex ? String(row[wellColumnIndex]) : '',
+                    reason: String(wellError.message || wellError)
+                });
+            }
+        }
+
+        for (var wellIndex = 0; wellIndex < 96; wellIndex++) {
+            var wellName = wellNameForIndex(wellIndex);
+            if (isReservedPlateWellName(wellName)) {
+                continue;
+            }
+            if (!occupied[wellName]) {
+                missingRows.push(wellName);
+                continue;
+            }
+            var imageCode = imageCodeForWell(plateNumber, wellName);
+            var missingForWell = [];
+            for (var imageIndex = 0; imageIndex < expectedImageKinds.length; imageIndex++) {
+                var kind = expectedImageKinds[imageIndex];
+                var imageFile = new File(imageDir, imageCode + '_' + kind + '.png');
+                if (!imageFile.exists()) {
+                    missingForWell.push(kind);
+                }
+            }
+            if (missingForWell.length > 0) {
+                missingImages.push({
+                    well: wellName,
+                    missing: missingForWell
+                });
+            }
+        }
+
+        var scanIdColumn = plateHeaderIndex(headers, 'Scan ID');
+        var targetNumberColumn = plateHeaderIndex(headers, 'Target Number');
+        var sourceImageColumn = plateHeaderIndex(headers, 'Source Scan Image');
+        for (var metadataRowIndex = 0; metadataRowIndex < plateData.rows.length; metadataRowIndex++) {
+            var metadataRow = plateData.rows[metadataRowIndex];
+            if (rowMarksWellUnavailable(metadataRow, statusColumnIndex)
+                    || metadataRow.length <= wellColumnIndex
+                    || !metadataRow[wellColumnIndex]) {
+                continue;
+            }
+            var metadataWell = '';
+            try {
+                metadataWell = normalizeWellName(metadataRow[wellColumnIndex]);
+            }
+            catch (metadataWellError) {
+                continue;
+            }
+            if (isReservedPlateWellName(metadataWell)) {
+                continue;
+            }
+            if ((scanIdColumn >= 0 && String(metadataRow[scanIdColumn] || '').trim().length === 0)
+                    || (targetNumberColumn >= 0 && String(metadataRow[targetNumberColumn] || '').trim().length === 0)
+                    || (sourceImageColumn >= 0 && String(metadataRow[sourceImageColumn] || '').trim().length === 0)) {
+                missingTraceMetadata.push(metadataWell);
+            }
+        }
+
+        var occupiedCount = 0;
+        for (var occupiedWell in occupied) {
+            if (occupied.hasOwnProperty(occupiedWell)) {
+                occupiedCount++;
+            }
+        }
+
+        var passed = occupiedCount >= PLATE_FILLABLE_WELL_COUNT
+            && duplicateWells.length === 0
+            && invalidWellRows.length === 0
+            && missingRows.length === 0
+            && missingImages.length === 0
+            && missingTraceMetadata.length === 0;
+        var report = {
+            plate_number: plateNumber,
+            audited_at: new Date().toISOString(),
+            trigger_scan_id: triggerScanId || '',
+            fillable_wells_expected: PLATE_FILLABLE_WELL_COUNT,
+            occupied_wells_found: occupiedCount,
+            reserved_negative_control_well: RESERVED_NEGATIVE_CONTROL_WELL,
+            passed: passed,
+            duplicate_wells: duplicateWells,
+            invalid_well_rows: invalidWellRows,
+            missing_or_unoccupied_wells: missingRows,
+            unavailable_csv_rows: unavailableRows,
+            missing_images: missingImages,
+            missing_trace_metadata: missingTraceMetadata
+        };
+        var auditFile = new File(auditDir, 'plate_audit_' + timestamp() + '.json');
+        writeText(auditFile, JSON.stringify(report, null, 2) + '\n');
+        writeText(latestPlateAuditFile(plateContext), JSON.stringify(report, null, 2) + '\n');
+        print('Completed plate audit for ' + plateNumber + ': '
+            + (passed ? 'PASS' : 'CHECK NEEDED')
+            + '. Report: ' + auditFile.getAbsolutePath());
+        return report;
+    }
+
+    function plateAttemptLogFile(plateContext) {
+        return new File(plateImageFolder(plateContext.plateNumber), 'plate_attempts.jsonl');
+    }
+
+    function targetNumberForMetadata(target, targetIndex) {
+        if (target !== null && target !== undefined && target.reviewNumber !== undefined) {
+            return Number(target.reviewNumber);
+        }
+        if (targetIndex !== null && targetIndex !== undefined) {
+            return Number(targetIndex) + 1;
+        }
+        return '';
+    }
+
+    function plateTraceMetadata(scanDir, scanId, target, targetIndex, hiResImageFile, bottomImageFile, wellImageFile, confirmation) {
+        var sourceScanImage = '';
+        if (target !== null && target !== undefined && target.cropFile && String(target.cropFile).length > 0) {
+            sourceScanImage = String(target.cropFile);
+        }
+        return {
+            scanId: scanId || (scanDir === null || scanDir === undefined ? '' : scanDir.getName()),
+            scanDir: scanDir === null || scanDir === undefined ? '' : scanDir.getAbsolutePath(),
+            targetNumber: targetNumberForMetadata(target, targetIndex),
+            objectIndex: target === null || target === undefined ? '' : target.objectIndex,
+            sourceScanImage: sourceScanImage,
+            hiResImage: hiResImageFile === null || hiResImageFile === undefined ? '' : hiResImageFile.getName(),
+            bottomImage: bottomImageFile === null || bottomImageFile === undefined ? '' : bottomImageFile.getName(),
+            wellImage: wellImageFile === null || wellImageFile === undefined ? '' : wellImageFile.getName(),
+            confirmation: confirmation || ''
+        };
+    }
+
+    function appendPlateAttemptLog(scanDir, plateContext, well, target, targetIndex, hiResImageFile, bottomImageFile, wellImageFile, outcome, reason, scanId) {
+        var metadata = plateTraceMetadata(scanDir, scanId, target, targetIndex, hiResImageFile, bottomImageFile, wellImageFile, outcome);
+        metadata.plate_number = normalizePlateNumber(plateContext.plateNumber);
+        metadata.well = well === null || well === undefined ? '' : well.name;
+        metadata.reason = reason || '';
+        metadata.logged_at = new Date().toISOString();
+        appendText(plateAttemptLogFile(plateContext), JSON.stringify(metadata) + '\n');
     }
 
     function ensurePlateSpreadsheetHeader(plateContext) {
@@ -856,37 +3035,76 @@ with (imports) {
             writeText(file, csvLine(plateCsvHeaders()));
             print('Created plate spreadsheet CSV: ' + file.getAbsolutePath());
         }
+        else {
+            migratePlateSpreadsheetColumns(plateContext.plateNumber);
+        }
         return file;
     }
 
-    function appendPlateSpreadsheetRow(plateContext, well) {
-        var occupied = occupiedWellSet(plateContext.plateNumber);
-        if (occupied[well.name]) {
-            print('Plate spreadsheet already has well ' + well.name + '; not adding a duplicate row.');
-            return;
+    function appendPlateSpreadsheetRow(plateContext, well, metadata) {
+        if (isReservedPlateWellName(well.name)) {
+            throw new Error('Refusing to plate reserved negative control well ' + well.name + '.');
         }
         var file = ensurePlateSpreadsheetHeader(plateContext);
-        var nextNumber = readPlateRows(plateContext.plateNumber).length + 1;
-        var plateNumber = normalizePlateNumber(plateContext.plateNumber);
-        var row = [
-            nextNumber,
-            plateNumber,
-            plateContext.plateId,
-            well.name,
-            'DNA-' + plateNumber + '-' + well.name,
-            plateContext.collectionCode,
-            imageCodeForWell(plateNumber, well.name),
-            '',
-            '',
-            '',
-            '',
-            '',
-            '',
-            '',
-            '',
-            ''
-        ];
+        var plateData = readPlateRows(plateContext.plateNumber);
+        var wellColumnIndex = plateWellColumnIndex(plateData);
+        var statusColumnIndex = plateCurrentStatusColumnIndex(plateData);
+        var rows = plateData.rows;
+        for (var existingIndex = 0; existingIndex < rows.length; existingIndex++) {
+            var existingRow = rows[existingIndex];
+            if (existingRow.length <= wellColumnIndex || !existingRow[wellColumnIndex]) {
+                continue;
+            }
+            try {
+                if (normalizeWellName(existingRow[wellColumnIndex]) === well.name) {
+                    if (!rowMarksWellUnavailable(existingRow, statusColumnIndex)) {
+                        var headers = plateData.headers.length > 0 ? plateData.headers : plateCsvHeaders();
+                        var scanId = plateRowValueByHeader(headers, existingRow, 'Scan ID');
+                        var sourceScanImage = plateRowValueByHeader(headers, existingRow, 'Source Scan Image');
+                        var wellImage = plateRowValueByHeader(headers, existingRow, 'Well Image');
+                        if (String(scanId || '').trim().length === 0
+                                || String(sourceScanImage || '').trim().length === 0
+                                || String(wellImage || '').trim().length === 0) {
+                            applyPlateTraceMetadata(headers, existingRow, metadata);
+                            var refreshed = csvLine(headers);
+                            for (var refreshIndex = 0; refreshIndex < rows.length; refreshIndex++) {
+                                refreshed += csvLine(rows[refreshIndex]);
+                            }
+                            writeText(file, refreshed);
+                            sortPlateSpreadsheetRows(plateContext.plateNumber);
+                            print('Backfilled trace metadata for existing occupied well ' + well.name + '.');
+                        }
+                        else {
+                            print('Plate spreadsheet already has well ' + well.name + '; not adding a duplicate row.');
+                        }
+                        return;
+                    }
+                    if (statusColumnIndex >= 0) {
+                        while (existingRow.length <= statusColumnIndex) {
+                            existingRow.push('');
+                        }
+                        existingRow[statusColumnIndex] = '';
+                    }
+                    applyPlateTraceMetadata(plateData.headers.length > 0 ? plateData.headers : plateCsvHeaders(), existingRow, metadata);
+                    var updated = csvLine(plateData.headers.length > 0 ? plateData.headers : plateCsvHeaders());
+                    for (var rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+                        updated += csvLine(rows[rowIndex]);
+                    }
+                    writeText(file, updated);
+                    sortPlateSpreadsheetRows(plateContext.plateNumber);
+                    print('Reactivated existing plate spreadsheet row for filled well ' + well.name + '.');
+                    return;
+                }
+            }
+            catch (wellError) {
+                print('Ignoring invalid well value while appending plate row: ' + existingRow[wellColumnIndex]);
+            }
+        }
+        var nextNumber = plateRowsOnly(plateContext.plateNumber).length + 1;
+        var row = plateRowForWell(plateContext, well.name, '', metadata);
+        row[0] = nextNumber;
         appendText(file, csvLine(row));
+        sortPlateSpreadsheetRows(plateContext.plateNumber);
         print('Recorded plated specimen in ' + file.getAbsolutePath() + ' well ' + well.name);
     }
 
@@ -896,16 +3114,60 @@ with (imports) {
         var wells = [];
         for (var i = startIndex; i < 96; i++) {
             var name = wellNameForIndex(i);
-            if (!occupied[name]) {
+            if (!isReservedPlateWellIndex(i) && !occupied[name]) {
                 wells.push(i);
             }
         }
         return wells;
     }
 
-    function promptRetryEmptyWells(emptyWells) {
+    function wellQueueContains(wells, wellIndex) {
+        for (var i = 0; i < wells.length; i++) {
+            if (Number(wells[i]) === Number(wellIndex)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function refillThenRemainingWellQueue(plateContext, refillWells, reviewedEmptyWells) {
+        var queue = [];
+        var refillSet = {};
+        for (var i = 0; i < refillWells.length; i++) {
+            var refillIndex = Number(refillWells[i].index);
+            if (!isReservedPlateWellIndex(refillIndex) && !wellQueueContains(queue, refillIndex)) {
+                queue.push(refillIndex);
+            }
+            refillSet[String(refillIndex)] = true;
+        }
+
+        var excludedReviewedWells = {};
+        if (reviewedEmptyWells) {
+            for (var reviewedIndex = 0; reviewedIndex < reviewedEmptyWells.length; reviewedIndex++) {
+                var reviewedWellIndex = Number(reviewedEmptyWells[reviewedIndex].index);
+                if (!refillSet[String(reviewedWellIndex)]) {
+                    excludedReviewedWells[String(reviewedWellIndex)] = true;
+                }
+            }
+        }
+
+        var remaining = wellQueueFromStart(plateContext);
+        for (var remainingIndex = 0; remainingIndex < remaining.length; remainingIndex++) {
+            if (!excludedReviewedWells[String(Number(remaining[remainingIndex]))]
+                    && !wellQueueContains(queue, remaining[remainingIndex])) {
+                queue.push(Number(remaining[remainingIndex]));
+            }
+        }
+        return queue;
+    }
+
+    function promptRetryEmptyWells(emptyWells, remainingTargetCount) {
         if (!emptyWells || emptyWells.length === 0) {
-            return [];
+            return {
+                wells: [],
+                occupiedWells: [],
+                mode: 'cancel'
+            };
         }
 
         var panel = new JPanel(new BorderLayout(8, 8));
@@ -930,7 +3192,16 @@ with (imports) {
         }
 
         panel.add(
-            new JLabel('Review wells not confirmed occupied. Uncheck any well that already contains a specimen.'),
+            new JLabel(
+                '<html>Review wells not confirmed occupied. '
+                    + 'Return specimens from recovery tray to sorting tray. '
+                    + 'Uncheck any well that already contains a specimen.'
+                    + (Number(remainingTargetCount || 0) > 0
+                        ? '<br>' + Number(remainingTargetCount || 0)
+                            + ' approved target(s) from the previous scan were not picked yet.'
+                        : '')
+                    + '</html>'
+            ),
             BorderLayout.NORTH
         );
         var scroll = new JScrollPane(listPanel);
@@ -945,16 +3216,128 @@ with (imports) {
             JOptionPane.WARNING_MESSAGE
         );
         if (result !== JOptionPane.OK_OPTION) {
-            return [];
+            return {
+                wells: [],
+                occupiedWells: [],
+                mode: 'cancel'
+            };
         }
 
         var selectedWells = [];
+        var occupiedWells = [];
         for (var selectedIndex = 0; selectedIndex < emptyWells.length; selectedIndex++) {
             if (checkboxes[selectedIndex].isSelected()) {
                 selectedWells.push(emptyWells[selectedIndex]);
             }
+            else {
+                occupiedWells.push(emptyWells[selectedIndex]);
+            }
         }
-        return selectedWells;
+        if (selectedWells.length === 0) {
+            return {
+                wells: [],
+                occupiedWells: occupiedWells,
+                mode: 'manual_occupied_only'
+            };
+        }
+
+        if (Number(remainingTargetCount || 0) <= 0) {
+            return {
+                wells: selectedWells,
+                occupiedWells: occupiedWells,
+                mode: 'rescan'
+            };
+        }
+
+        var modeChoice = JOptionPane.showOptionDialog(
+            null,
+            'Fill ' + selectedWells.length + ' missed well(s) using the remaining target(s) from this scan, or rescan the sorting tray first?',
+            'Fill missed wells',
+            JOptionPane.YES_NO_CANCEL_OPTION,
+            JOptionPane.QUESTION_MESSAGE,
+            null,
+            Java.to(['Continue previous scan', 'Rescan sorting tray', 'Cancel refill'], 'java.lang.Object[]'),
+            'Continue previous scan'
+        );
+        if (modeChoice === 0) {
+            return {
+                wells: selectedWells,
+                occupiedWells: occupiedWells,
+                mode: 'continue_previous_scan'
+            };
+        }
+        if (modeChoice === 1) {
+            return {
+                wells: selectedWells,
+                occupiedWells: occupiedWells,
+                mode: 'rescan'
+            };
+        }
+        return {
+            wells: [],
+            occupiedWells: occupiedWells,
+            mode: 'cancel'
+        };
+    }
+
+    function recordManuallyConfirmedOccupiedWells(scanDir, plateContext, occupiedWells) {
+        if (!occupiedWells || occupiedWells.length === 0) {
+            return;
+        }
+        for (var i = 0; i < occupiedWells.length; i++) {
+            var reviewed = occupiedWells[i];
+            var well = {
+                name: reviewed.name,
+                index: Number(reviewed.index)
+            };
+            var target = reviewed.target || null;
+            var hiResImageFile = reviewed.hiResImageFile || hiResImageFileForTarget(scanDir, target);
+            var bottomImageFile = reviewed.bottomImageFile || null;
+            var wellImageFile = reviewed.imageFile || null;
+            var latestAttempt = null;
+            if (wellImageFile === null || wellImageFile === undefined || !wellImageFile.exists()) {
+                latestAttempt = latestPlateAttemptForWell(plateContext, well.name);
+                if (latestAttempt === null) {
+                    print('Manual occupied review for ' + reviewed.name
+                        + ' has no well QA image and no recoverable attempt; skipping CSV/image backfill.');
+                    continue;
+                }
+            }
+            var metadata = latestAttempt === null
+                ? plateTraceMetadata(
+                    scanDir,
+                    scanDir === null || scanDir === undefined ? '' : scanDir.getName(),
+                    target,
+                    reviewed.targetIndex,
+                    hiResImageFile,
+                    bottomImageFile,
+                    wellImageFile,
+                    'manual occupied review'
+                )
+                : plateTraceMetadataFromAttempt(latestAttempt, 'manual occupied review recovered from latest attempt');
+            if (latestAttempt === null) {
+                copyPlateSpecimenImages(scanDir, plateContext, well, target, hiResImageFile, bottomImageFile, wellImageFile);
+            }
+            else {
+                copyPlateSpecimenImagesFromAttempt(plateContext, well, latestAttempt);
+            }
+            appendPlateSpreadsheetRow(plateContext, well, metadata);
+            appendPlateAttemptLog(
+                latestAttempt === null ? scanDir : new File(String(latestAttempt.scanDir || '')),
+                plateContext,
+                well,
+                target,
+                latestAttempt === null ? reviewed.targetIndex : Number(latestAttempt.targetNumber || 1) - 1,
+                latestAttempt === null ? hiResImageFile : resolveAttemptImageFile(latestAttempt, 'hires'),
+                latestAttempt === null ? bottomImageFile : resolveAttemptImageFile(latestAttempt, 'bottom'),
+                latestAttempt === null ? wellImageFile : resolveAttemptImageFile(latestAttempt, 'well'),
+                metadata.confirmation,
+                reviewed.reason || '',
+                metadata.scanId
+            );
+            print('Recorded manually confirmed occupied well ' + reviewed.name
+                + ' in plate CSV and review image folder.');
+        }
     }
 
     function writePickingPreview(scanDir, scanId, target, targetIndex, totalTargets, moveX, moveY, extraFields) {
@@ -991,6 +3374,10 @@ with (imports) {
             }
         }
         writeText(detectionStatusFile, JSON.stringify(record, null, 2) + '\n');
+        writeText(
+            new File(scanDir, 'pick_command_' + pad(targetIndex + 1, 3) + '.json'),
+            JSON.stringify(record, null, 2) + '\n'
+        );
     }
 
     function writeInspectionPreview(scanDir, scanId, target, targetIndex, totalTargets, imageFile, x, y, z) {
@@ -1045,6 +3432,35 @@ with (imports) {
             record.qa_dark_fraction = result.dark_fraction;
             record.qa_largest_area_px = result.largest_area_px;
         }
+        writeText(detectionStatusFile, JSON.stringify(record, null, 2) + '\n');
+        writeText(
+            new File(scanDir, 'qa_command_' + pad(targetIndex + 1, 3) + '.json'),
+            JSON.stringify(record, null, 2) + '\n'
+        );
+    }
+
+    function writeHiResPreview(scanDir, target, targetIndex, totalTargets, imageFile, label, x, y, z, sharpnessScore) {
+        var detectionStatusFile = new File(projectDir, 'control/detection_status.json');
+        var record = {
+            status: 'detected',
+            scan_dir: scanDir.getAbsolutePath(),
+            updated_at: new Date().toISOString(),
+            frame_index: target.frameIndex,
+            source_file: imageFile.getName(),
+            preview_file: imageFile.getAbsolutePath(),
+            detections_in_frame: 1,
+            duplicates_in_frame: 0,
+            unique_object_count: totalTargets,
+            duplicate_count: 0,
+            label: label,
+            centroid_x_px: target.centroidX,
+            centroid_y_px: target.centroidY,
+            score: target.score,
+            hires_x_mm: x,
+            hires_y_mm: y,
+            hires_z_mm: z,
+            hires_sharpness_score: sharpnessScore
+        };
         writeText(detectionStatusFile, JSON.stringify(record, null, 2) + '\n');
     }
 
@@ -1118,12 +3534,45 @@ with (imports) {
             builder.directory(projectDir);
             builder.redirectOutput(stdoutLog);
             builder.redirectError(stderrLog);
-            builder.start();
+            var process = builder.start();
             print('Launched ' + detectorMode + ' segmentation for: ' + scanDir.getAbsolutePath());
+            return process;
         }
         catch (error) {
             print('Failed to launch segmentation: ' + error);
             print('See: ' + stderrLog.getAbsolutePath());
+            return null;
+        }
+    }
+
+    function runInsectDebrisClassifier(scanDir, controlDir) {
+        var classifierScript = new File(scriptsDir, '05_Classify_Review_Targets.py').getAbsolutePath();
+        var stdoutLog = new File(controlDir, 'insect_debris_classifier.out.log');
+        var stderrLog = new File(controlDir, 'insect_debris_classifier.err.log');
+
+        try {
+            var builder = new Packages.java.lang.ProcessBuilder(
+                python,
+                classifierScript,
+                scanDir.getAbsolutePath()
+            );
+            builder.directory(projectDir);
+            builder.redirectOutput(stdoutLog);
+            builder.redirectError(stderrLog);
+            var process = builder.start();
+            var exitCode = process.waitFor();
+            if (exitCode === 0) {
+                print('Classified target crops for review: ' + scanDir.getAbsolutePath());
+                return true;
+            }
+            print('Insect/debris classifier exited with code ' + exitCode + '. Review will continue without model labels.');
+            print('See: ' + stderrLog.getAbsolutePath());
+            return false;
+        }
+        catch (error) {
+            print('Failed to run insect/debris classifier: ' + error);
+            print('See: ' + stderrLog.getAbsolutePath());
+            return false;
         }
     }
 
@@ -1210,110 +3659,12 @@ with (imports) {
     }
 
     function readTouchCorrection() {
-        var calibrationFile = new File(projectDir, 'control/touch_calibration.jsonl');
-        var correction = {
+        return {
             x: 0.0,
             y: 0.0,
             z: -44.7,
-            source: 'none'
+            source: 'no BugPicker XY correction'
         };
-
-        if (!calibrationFile.exists()) {
-            return correction;
-        }
-
-        var sampleXs = [];
-        var sampleYs = [];
-        var legacySampleXs = [];
-        var lastZ = correction.z;
-        var lastRecordedAt = null;
-        var fallbackCorrection = null;
-        var reader = new BufferedReader(new FileReader(calibrationFile));
-        try {
-            var line = reader.readLine();
-            while (line !== null) {
-                line = String(line).trim();
-                if (line.length > 0) {
-                    try {
-                        var record = JSON.parse(line);
-                        if (record.raw_commanded_x_mm !== undefined
-                                && record.raw_commanded_y_mm !== undefined
-                                && record.recorded_x_mm !== undefined
-                                && record.recorded_y_mm !== undefined) {
-                            var sampleX = Number(record.recorded_x_mm) - Number(record.raw_commanded_x_mm);
-                            var sampleY = Number(record.recorded_y_mm) - Number(record.raw_commanded_y_mm);
-                            if (String(record.coordinate_transform_version || '') === currentCoordinateTransformVersion) {
-                                sampleXs.push(sampleX);
-                                sampleYs.push(sampleY);
-                            }
-                            else {
-                                legacySampleXs.push(sampleX);
-                            }
-                            if (record.recorded_z_mm !== undefined) {
-                                lastZ = Number(record.recorded_z_mm);
-                            }
-                            lastRecordedAt = record.recorded_at;
-                        }
-                        else if (record.total_correction_x_mm !== undefined
-                                && record.total_correction_y_mm !== undefined) {
-                            fallbackCorrection = {
-                                x: Number(record.total_correction_x_mm),
-                                y: Number(record.total_correction_y_mm),
-                                source: 'latest total from ' + record.recorded_at
-                            };
-                            if (record.recorded_z_mm !== undefined) {
-                                lastZ = Number(record.recorded_z_mm);
-                            }
-                        }
-                        else if (record.correction_x_mm !== undefined
-                                && record.correction_y_mm !== undefined) {
-                            fallbackCorrection = {
-                                x: Number(record.correction_x_mm),
-                                y: Number(record.correction_y_mm),
-                                source: 'legacy residual from ' + record.recorded_at
-                            };
-                            if (record.recorded_z_mm !== undefined) {
-                                lastZ = Number(record.recorded_z_mm);
-                            }
-                        }
-                    }
-                    catch (parseError) {
-                        print('Skipping unreadable touch calibration record: ' + parseError);
-                    }
-                }
-                line = reader.readLine();
-            }
-        }
-        finally {
-            reader.close();
-        }
-
-        if (sampleXs.length > 0 && sampleYs.length > 0) {
-            correction.x = medianNumber(sampleXs);
-            correction.y = medianNumber(sampleYs);
-            correction.z = lastZ;
-            correction.source = 'median of ' + sampleXs.length + ' saved jog sample(s)'
-                + (lastRecordedAt === null ? '' : '; latest ' + lastRecordedAt);
-            return correction;
-        }
-
-        if (legacySampleXs.length > 0) {
-            correction.x = medianNumber(legacySampleXs);
-            correction.y = 0.0;
-            correction.z = lastZ;
-            correction.source = 'legacy X median of ' + legacySampleXs.length + ' sample(s); Y reset for '
-                + currentCoordinateTransformVersion
-                + (lastRecordedAt === null ? '' : '; latest ' + lastRecordedAt);
-            return correction;
-        }
-
-        if (fallbackCorrection !== null) {
-            correction.x = fallbackCorrection.x;
-            correction.y = fallbackCorrection.y;
-            correction.z = lastZ;
-            correction.source = fallbackCorrection.source;
-        }
-        return correction;
     }
 
     function medianNumber(values) {
@@ -1970,6 +4321,101 @@ with (imports) {
         return decisions;
     }
 
+    function classifierPredictionFile(scanDir) {
+        return new File(scanDir, 'classifier_predictions.jsonl');
+    }
+
+    function readClassifierPredictions(scanDir) {
+        var file = classifierPredictionFile(scanDir);
+        var predictions = {};
+        if (!file.exists()) {
+            return predictions;
+        }
+
+        var reader = new BufferedReader(new FileReader(file));
+        try {
+            var line = reader.readLine();
+            while (line !== null) {
+                line = String(line).trim();
+                if (line.length > 0) {
+                    try {
+                        var record = JSON.parse(line);
+                        predictions[String(record.object_index)] = record;
+                    }
+                    catch (parseError) {
+                        print('Skipping unreadable classifier prediction: ' + parseError);
+                    }
+                }
+                line = reader.readLine();
+            }
+        }
+        finally {
+            reader.close();
+        }
+        return predictions;
+    }
+
+    function attachClassifierPredictions(scanDir, targets) {
+        var predictions = readClassifierPredictions(scanDir);
+        for (var i = 0; i < targets.length; i++) {
+            var target = targets[i];
+            var prediction = predictions[String(target.originalObjectIndex)];
+            if (!prediction) {
+                prediction = predictions[String(target.objectIndex)];
+            }
+            if (prediction) {
+                target.classifierClass = String(prediction['class'] || 'unknown');
+                target.classifierWouldPick = Boolean(prediction.would_pick);
+                target.classifierInsectProbability = prediction.insect_probability === null || prediction.insect_probability === undefined
+                    ? null
+                    : Number(prediction.insect_probability);
+                target.classifierDebrisProbability = prediction.debris_probability === null || prediction.debris_probability === undefined
+                    ? null
+                    : Number(prediction.debris_probability);
+                target.classifierThreshold = prediction.threshold === null || prediction.threshold === undefined
+                    ? null
+                    : Number(prediction.threshold);
+                target.classifierError = String(prediction.error || '');
+            }
+        }
+    }
+
+    function appendClassifierFeedback(scanDir, scanId, record) {
+        var feedbackDir = new File(scriptsDir, 'Data/classifier_feedback');
+        feedbackDir.mkdirs();
+        var feedbackFile = new File(feedbackDir, 'insect_debris_feedback.jsonl');
+        var scanFeedbackFile = new File(scanDir, 'classifier_feedback.jsonl');
+        var payload = JSON.stringify(record) + '\n';
+
+        var writer = new FileWriter(feedbackFile, true);
+        try {
+            writer.write(payload);
+        }
+        finally {
+            writer.close();
+        }
+
+        var scanWriter = new FileWriter(scanFeedbackFile, true);
+        try {
+            scanWriter.write(payload);
+        }
+        finally {
+            scanWriter.close();
+        }
+    }
+
+    function debrisClassifierMode() {
+        var calibration = loadTrainingTrayCalibration(defaultTrainingTrayCalibrationValues());
+        var mode = calibration.multiConfig && calibration.multiConfig.shared
+            ? String(calibration.multiConfig.shared.debris_classifier_mode || 'train')
+            : 'train';
+        return mode === 'auto' ? 'auto' : 'train';
+    }
+
+    function classifierDecisionForTarget(target) {
+        return target.classifierClass === 'debris' ? 'debris' : 'specimen';
+    }
+
     function sanitizeTrainingLabel(label) {
         var text = String(label || '').toLowerCase();
         text = text.replace(/[^a-z0-9]+/g, '_');
@@ -2012,9 +4458,10 @@ with (imports) {
         return targetFile.getPath();
     }
 
-    function writePickReviewDecisions(scanDir, scanId, targets, decisions, debrisSubtypes) {
+    function writePickReviewDecisions(scanDir, scanId, targets, decisions, debrisSubtypes, reviewSource) {
         var file = reviewDecisionFile(scanDir);
         var writer = new FileWriter(file);
+        var source = reviewSource === undefined ? 'manual' : String(reviewSource);
         try {
             for (var i = 0; i < targets.length; i++) {
                 var target = targets[i];
@@ -2052,9 +4499,19 @@ with (imports) {
                     pick_y_mm: target.y,
                     detection_score: target.score,
                     detection_quality_score: targetQualityScore(target),
+                    classifier_prediction: String(target.classifierClass || ''),
+                    classifier_would_pick: target.classifierWouldPick === undefined ? null : Boolean(target.classifierWouldPick),
+                    classifier_insect_probability: target.classifierInsectProbability,
+                    classifier_debris_probability: target.classifierDebrisProbability,
+                    classifier_threshold: target.classifierThreshold,
+                    classifier_error: String(target.classifierError || ''),
+                    review_source: source,
                     reviewed_at: new Date().toISOString()
                 };
                 writer.write(JSON.stringify(record) + '\n');
+                if (source === 'manual') {
+                    appendClassifierFeedback(scanDir, scanId, record);
+                }
             }
         }
         finally {
@@ -2205,10 +4662,37 @@ with (imports) {
         var summaryFile = complete !== null && complete.summary_file
             ? new File(scanDir, String(complete.summary_file))
             : new File(scanDir, 'detection_summary.png');
-        var targets = readPickTargets(scanDir, true, true, false);
+        runInsectDebrisClassifier(scanDir, new File(projectDir, 'control'));
+        var targets = readPickTargets(scanDir, true, true, true);
+        attachClassifierPredictions(scanDir, targets);
         targets.sort(function(a, b) {
             return Number(a.objectIndex) - Number(b.objectIndex);
         });
+        if (debrisClassifierMode() === 'auto') {
+            var autoDecisions = {};
+            var autoDebrisSubtypes = {};
+            var autoSpecimenCount = 0;
+            var autoDebrisCount = 0;
+            for (var autoIndex = 0; autoIndex < targets.length; autoIndex++) {
+                var autoTarget = targets[autoIndex];
+                var autoDecision = classifierDecisionForTarget(autoTarget);
+                autoDecisions[String(autoTarget.objectIndex)] = autoDecision;
+                autoDebrisSubtypes[String(autoTarget.objectIndex)] = autoDecision === 'debris'
+                    ? 'classifier'
+                    : 'uncertain';
+                if (autoDecision === 'debris') {
+                    autoDebrisCount++;
+                }
+                else {
+                    autoSpecimenCount++;
+                }
+            }
+            writePickReviewDecisions(scanDir, scanId, targets, autoDecisions, autoDebrisSubtypes, 'classifier_auto');
+            print('Auto-classified debris before picking: specimens=' + autoSpecimenCount
+                + ' debris=' + autoDebrisCount
+                + ' total=' + targets.length);
+            return true;
+        }
         var queue = new Packages.java.util.concurrent.ArrayBlockingQueue(1);
         var runnable = new Packages.java.lang.Runnable({
             run: function() {
@@ -2227,6 +4711,7 @@ with (imports) {
                 var FlowLayout = Packages.java.awt.FlowLayout;
                 var Image = Packages.java.awt.Image;
                 var Dimension = Packages.java.awt.Dimension;
+                var Font = Packages.java.awt.Font;
                 var EmptyBorder = Packages.javax.swing.border.EmptyBorder;
                 var ActionListener = Packages.java.awt.event.ActionListener;
                 var WindowAdapter = Packages.java.awt.event.WindowAdapter;
@@ -2239,17 +4724,24 @@ with (imports) {
                 panel.setBorder(new EmptyBorder(12, 12, 12, 12));
 
                 var details = new JPanel(new GridLayout(0, 1, 2, 2));
+                details.setFont(new Font('Dialog', Font.PLAIN, 18));
                 var objectCount = complete === null ? 0 : Number(complete.object_count || 0);
                 var candidateCount = complete === null ? 0 : Number(complete.candidate_count || 0);
                 var duplicateCount = complete === null ? 0 : Number(complete.duplicate_count || 0);
-                details.add(new JLabel('Unique targets: ' + objectCount));
-                details.add(new JLabel('Frame candidates: ' + candidateCount + '   Duplicates: ' + duplicateCount));
+                var uniqueLabel = new JLabel('Unique targets: ' + objectCount);
+                var candidateLabel = new JLabel('Frame candidates: ' + candidateCount + '   Duplicates: ' + duplicateCount);
+                uniqueLabel.setFont(new Font('Dialog', Font.PLAIN, 18));
+                candidateLabel.setFont(new Font('Dialog', Font.PLAIN, 18));
+                details.add(uniqueLabel);
+                details.add(candidateLabel);
                 panel.add(details, BorderLayout.NORTH);
 
                 var centerPanel = new JPanel(new GridLayout(1, 2, 10, 0));
-                var imageLabel = makeScaledImageLabel(summaryFile, ImageIcon, JLabel, Image, 520, 720);
+                var imageLabel = makeScaledImageLabel(summaryFile, ImageIcon, JLabel, Image, 900, 900);
                 if (imageLabel !== null) {
-                    centerPanel.add(new JScrollPane(imageLabel));
+                    var summaryScroll = new JScrollPane(imageLabel);
+                    summaryScroll.setPreferredSize(new Dimension(940, 820));
+                    centerPanel.add(summaryScroll);
                 }
                 else {
                     centerPanel.add(new JLabel('No detection summary image found: ' + summaryFile.getAbsolutePath()));
@@ -2257,10 +4749,11 @@ with (imports) {
 
                 var reviewPanel = new JPanel(new BorderLayout(6, 6));
                 var targetLabel = new JLabel('');
+                var classifierLabel = new JLabel('');
                 var zoomLabel = new JLabel('');
                 zoomLabel.setHorizontalAlignment(JLabel.CENTER);
                 var zoomScroll = new JScrollPane(zoomLabel);
-                zoomScroll.setPreferredSize(new Dimension(640, 520));
+                zoomScroll.setPreferredSize(new Dimension(940, 640));
                 var specimenButton = new JRadioButton('pick - specimen');
                 var debrisButton = new JRadioButton("don't pick - debris");
                 var debrisSubtypeLabel = new JLabel('debris type');
@@ -2272,6 +4765,17 @@ with (imports) {
                 debrisSubtypeModel.addElement('shadow/artifact');
                 var debrisSubtypeBox = new JComboBox(debrisSubtypeModel);
                 var selectionCountLabel = new JLabel('');
+                var pinnedSelectionCountLabel = new JLabel('');
+                var reviewFont = new Font('Dialog', Font.PLAIN, 20);
+                var reviewBoldFont = new Font('Dialog', Font.BOLD, 20);
+                targetLabel.setFont(reviewBoldFont);
+                classifierLabel.setFont(reviewBoldFont);
+                specimenButton.setFont(reviewFont);
+                debrisButton.setFont(reviewFont);
+                debrisSubtypeLabel.setFont(reviewFont);
+                debrisSubtypeBox.setFont(reviewFont);
+                selectionCountLabel.setFont(reviewFont);
+                pinnedSelectionCountLabel.setFont(reviewBoldFont);
                 var group = new ButtonGroup();
                 group.add(specimenButton);
                 group.add(debrisButton);
@@ -2281,7 +4785,9 @@ with (imports) {
 
                 for (var targetIndex = 0; targetIndex < targets.length; targetIndex++) {
                     targets[targetIndex].reviewNumber = targetIndex + 1;
-                    decisions[String(targets[targetIndex].objectIndex)] = 'specimen';
+                    decisions[String(targets[targetIndex].objectIndex)] = targets[targetIndex].classifierClass === 'debris'
+                        ? 'debris'
+                        : 'specimen';
                     debrisSubtypes[String(targets[targetIndex].objectIndex)] = 'uncertain';
                 }
 
@@ -2307,9 +4813,11 @@ with (imports) {
                 }
 
                 function updateSelectionCount() {
-                    selectionCountLabel.setText('Initial targets: ' + targets.length
+                    var countText = 'Initial targets: ' + targets.length
                         + '   Selected to pick: ' + selectedSpecimenCount()
-                        + '   Unsafe close: ' + unsafeTargetCount());
+                        + '   Unsafe close: ' + unsafeTargetCount();
+                    selectionCountLabel.setText(countText);
+                    pinnedSelectionCountLabel.setText(countText);
                 }
 
                 function updateDebrisSubtypeEnabled() {
@@ -2334,6 +4842,7 @@ with (imports) {
                 function showTarget(index) {
                     if (targets.length === 0) {
                         targetLabel.setText('No unique targets available.');
+                        classifierLabel.setText('');
                         zoomLabel.setIcon(null);
                         specimenButton.setEnabled(false);
                         debrisButton.setEnabled(false);
@@ -2351,6 +4860,8 @@ with (imports) {
                     updateDebrisSubtypeEnabled();
                     targetLabel.setText('Target ' + target.reviewNumber
                         + ' of ' + targets.length
+                        + ' | tray ' + target.sortingTraySlot
+                        + ' event ' + target.collectionEventSlot
                         + ' | object ' + target.objectIndex
                         + ' | frame ' + target.frameIndex
                         + (target.recoveredDuplicate ? ' | recovered duplicate' : '')
@@ -2365,8 +4876,17 @@ with (imports) {
                                         + Number(target.unsafeNeighborDistanceMm).toFixed(2)
                                         + 'mm')
                             : ''));
+                    var probabilityText = target.classifierInsectProbability === null || target.classifierInsectProbability === undefined
+                        ? ''
+                        : ' | insect p=' + Number(target.classifierInsectProbability).toFixed(2)
+                            + ' debris p=' + Number(target.classifierDebrisProbability).toFixed(2)
+                            + ' threshold=' + Number(target.classifierThreshold).toFixed(2);
+                    classifierLabel.setText('Classifier: '
+                        + (target.classifierClass || 'not available')
+                        + probabilityText
+                        + (target.classifierError ? ' | ' + target.classifierError : ''));
                     var targetImage = imageFileForTarget(scanDir, target);
-                    var icon = scaledIconForFile(targetImage, ImageIcon, Image, 620, 500);
+                    var icon = scaledIconForFile(targetImage, ImageIcon, Image, 860, 540);
                     if (icon !== null) {
                         zoomLabel.setText('');
                         zoomLabel.setIcon(icon);
@@ -2377,9 +4897,13 @@ with (imports) {
                     }
                 }
 
-                var nav = new JPanel(new FlowLayout(FlowLayout.CENTER));
+                var nav = new JPanel(new BorderLayout(8, 4));
                 var prevButton = new JButton('<');
                 var nextButton = new JButton('>');
+                prevButton.setFont(reviewBoldFont);
+                nextButton.setFont(reviewBoldFont);
+                prevButton.setPreferredSize(new Dimension(72, 44));
+                nextButton.setPreferredSize(new Dimension(72, 44));
                 prevButton.addActionListener(new ActionListener({
                     actionPerformed: function(event) {
                         saveCurrentDecision();
@@ -2392,9 +4916,15 @@ with (imports) {
                         showTarget(currentIndex + 1);
                     }
                 }));
-                nav.add(prevButton);
-                nav.add(targetLabel);
-                nav.add(nextButton);
+                var targetHeader = new JPanel(new BorderLayout(8, 2));
+                targetHeader.add(targetLabel, BorderLayout.CENTER);
+                var targetHeaderSouth = new JPanel(new GridLayout(0, 1, 2, 2));
+                targetHeaderSouth.add(classifierLabel);
+                targetHeaderSouth.add(pinnedSelectionCountLabel);
+                targetHeader.add(targetHeaderSouth, BorderLayout.SOUTH);
+                nav.add(prevButton, BorderLayout.WEST);
+                nav.add(targetHeader, BorderLayout.CENTER);
+                nav.add(nextButton, BorderLayout.EAST);
 
                 var choicePanel = new JPanel(new FlowLayout(FlowLayout.CENTER));
                 choicePanel.add(specimenButton);
@@ -2426,6 +4956,8 @@ with (imports) {
 
                 var buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT));
                 var startButton = new JButton('Start Picking');
+                startButton.setFont(reviewBoldFont);
+                startButton.setPreferredSize(new Dimension(190, 52));
                 buttons.add(startButton);
                 panel.add(buttons, BorderLayout.SOUTH);
 
@@ -2447,6 +4979,15 @@ with (imports) {
                 showTarget(0);
                 frame.setContentPane(panel);
                 frame.pack();
+                var screenSize = Packages.java.awt.Toolkit.getDefaultToolkit().getScreenSize();
+                var maxFrameWidth = Math.max(1200, Number(screenSize.width) - 120);
+                var maxFrameHeight = Math.max(900, Number(screenSize.height) - 120);
+                if (frame.getWidth() > maxFrameWidth || frame.getHeight() > maxFrameHeight) {
+                    frame.setSize(
+                        Math.min(frame.getWidth(), maxFrameWidth),
+                        Math.min(frame.getHeight(), maxFrameHeight)
+                    );
+                }
                 frame.setLocationRelativeTo(null);
                 frame.setVisible(true);
             }
@@ -2836,8 +5377,8 @@ with (imports) {
             + ' at X=' + moveX.toFixed(3)
             + ' Y=' + moveY.toFixed(3)
             + ' Z=' + pickZ.toFixed(3));
-        moveNozzleToXyAtZ(nozzle, moveX, moveY, pickZ);
-        Packages.java.lang.Thread.sleep(1000);
+        twoStagePickDescent(nozzle, moveX, moveY, Number(nozzle.location.z), pickZ);
+        Packages.java.lang.Thread.sleep(300);
         return {
             success: true,
             z: pickZ,
@@ -2868,6 +5409,16 @@ with (imports) {
         moveNozzleToXyAtZ(nozzle, home.x, home.y, travelZ);
     }
 
+    function parkHeadAtMaxXy(topCamera, head) {
+        var maxX = 433.0;
+        var maxY = 487.0;
+        print('Parking head out of the way at max X=' + maxX.toFixed(3)
+            + ' Y=' + maxY.toFixed(3));
+        parkNozzlesForScan(head);
+        moveCameraToXy(topCamera, maxX, maxY);
+        print('Top camera after max-XY park: ' + formatLocation(topCamera.getLocation()));
+    }
+
     function inspectPickedTargetOnBottomCamera(scanDir, scanId, target, targetIndex, totalTargets, nozzle, travelZ) {
         var bottomCamera = findCameraByName('Bottom');
         var inspectionZ = -75.0;
@@ -2877,11 +5428,11 @@ with (imports) {
         var inspectionDir = new File(scanDir, 'bottom_inspections');
         inspectionDir.mkdirs();
 
-        var imageName = 'target_' + pad(targetIndex + 1, 3)
+        var imageBaseName = 'target_' + pad(targetIndex + 1, 3)
             + '_object_' + pad(target.objectIndex, 6)
-            + '_' + timestamp()
-            + '_bottom.png';
-        var imageFile = new File(inspectionDir, imageName);
+            + '_' + timestamp();
+        var fullImageFile = new File(inspectionDir, imageBaseName + '_bottom_full.png');
+        var cropImageFile = new File(inspectionDir, imageBaseName + '_bottom.png');
 
         print('Moving N1 to Bottom camera for target ' + (targetIndex + 1)
             + ' at X=' + inspectionX.toFixed(3)
@@ -2897,20 +5448,188 @@ with (imports) {
         Packages.java.lang.Thread.sleep(500);
 
         var image = bottomCamera.settleAndCapture();
-        ImageIO.write(image, 'PNG', imageFile);
-        print('Saved bottom-camera inspection image: ' + imageFile.getAbsolutePath());
+        ImageIO.write(image, 'PNG', fullImageFile);
+
+        var cropFraction = 0.50;
+        var cropWidth = Math.max(1, Math.round(image.getWidth() * cropFraction));
+        var cropHeight = Math.max(1, Math.round(image.getHeight() * cropFraction));
+        var cropX = Math.max(0, Math.round((image.getWidth() - cropWidth) / 2));
+        var cropY = Math.max(0, Math.round((image.getHeight() - cropHeight) / 2));
+        var cropImage = image.getSubimage(cropX, cropY, cropWidth, cropHeight);
+        ImageIO.write(cropImage, 'PNG', cropImageFile);
+
+        print('Saved bottom-camera inspection image: ' + cropImageFile.getAbsolutePath()
+            + ' (full frame: ' + fullImageFile.getAbsolutePath() + ')');
         writeInspectionPreview(
             scanDir,
             scanId,
             target,
             targetIndex,
             totalTargets,
-            imageFile,
+            cropImageFile,
             inspectionX,
             inspectionY,
             inspectionZ
         );
         moveNozzleToXyAtZ(nozzle, inspectionX, inspectionY, travelZ);
+        return {
+            fullImageFile: fullImageFile,
+            cropImageFile: cropImageFile
+        };
+    }
+
+    function hiResImageFileForTarget(scanDir, target) {
+        if (scanDir === null || scanDir === undefined || target === null || target === undefined) {
+            return null;
+        }
+        if (target.hiResImageFile && String(target.hiResImageFile).length > 0) {
+            var recorded = new File(String(target.hiResImageFile));
+            if (recorded.exists()) {
+                return recorded;
+            }
+        }
+        var hiResDir = new File(scanDir, 'hires');
+        if (!hiResDir.exists()) {
+            return null;
+        }
+        var objectText = pad(target.objectIndex, 6);
+        var files = hiResDir.listFiles();
+        if (files === null) {
+            return null;
+        }
+        for (var i = 0; i < files.length; i++) {
+            if (String(files[i].getName()).indexOf('_object_' + objectText + '_') >= 0
+                    && String(files[i].getName()).indexOf('_hires.png') >= 0) {
+                return files[i];
+            }
+        }
+        return null;
+    }
+
+    function imageSharpnessScore(image) {
+        var width = image.getWidth();
+        var height = image.getHeight();
+        if (width < 3 || height < 3) {
+            return 0.0;
+        }
+        var sum = 0.0;
+        var sumSquares = 0.0;
+        var count = 0;
+        var stepX = Math.max(1, Math.floor(width / 640));
+        var stepY = Math.max(1, Math.floor(height / 480));
+
+        function grayAt(x, y) {
+            var rgb = image.getRGB(x, y);
+            var red = (rgb >> 16) & 0xff;
+            var green = (rgb >> 8) & 0xff;
+            var blue = rgb & 0xff;
+            return (0.299 * red) + (0.587 * green) + (0.114 * blue);
+        }
+
+        for (var y = stepY; y < height - stepY; y += stepY) {
+            for (var x = stepX; x < width - stepX; x += stepX) {
+                var laplacian = (4.0 * grayAt(x, y))
+                    - grayAt(x - stepX, y)
+                    - grayAt(x + stepX, y)
+                    - grayAt(x, y - stepY)
+                    - grayAt(x, y + stepY);
+                sum += laplacian;
+                sumSquares += laplacian * laplacian;
+                count++;
+            }
+        }
+        if (count === 0) {
+            return 0.0;
+        }
+        var mean = sum / count;
+        return (sumSquares / count) - (mean * mean);
+    }
+
+    function focusSweepPositions(centerZ) {
+        var center = Math.max(hiResMinimumZ, Number(centerZ));
+        return [
+            Math.max(hiResMinimumZ, center - hiResFocusFastStepMm),
+            center,
+            Math.max(hiResMinimumZ, center + hiResFocusFastStepMm)
+        ];
+    }
+
+    function captureBestHiResImage(scanDir, scanId, target, targetIndex, totalTargets, hiResCamera, hiResMotionNozzle, x, y, focusCenterZ, travelZ, statusFile, label, outputDir, outputName) {
+        var hiResDir = outputDir || new File(scanDir, 'hires');
+        hiResDir.mkdirs();
+        var bestImage = null;
+        var safeFocusCenterZ = Math.max(hiResMinimumZ, Number(focusCenterZ));
+        var bestZ = safeFocusCenterZ;
+        var bestScore = -1.0;
+        var focusPositions = focusSweepPositions(safeFocusCenterZ);
+
+        print('HiRes autofocus for target ' + (targetIndex + 1)
+            + ' at X=' + x.toFixed(3)
+            + ' Y=' + y.toFixed(3)
+            + ' focus center Z=' + safeFocusCenterZ.toFixed(3)
+            + ' minimum allowed Z=' + hiResMinimumZ.toFixed(3)
+            + ' using camera ' + hiResCamera.getName());
+        moveNozzleToXyAtZ(hiResMotionNozzle, hiResMotionNozzle.location.x, hiResMotionNozzle.location.y, travelZ);
+        moveNozzleToXyAtZ(hiResMotionNozzle, x, y, travelZ);
+
+        setHiResLight(true);
+        try {
+            for (var i = 0; i < focusPositions.length; i++) {
+                var z = Number(focusPositions[i]);
+                moveNozzleToXyAtZ(hiResMotionNozzle, x, y, z);
+                Packages.java.lang.Thread.sleep(80);
+                var image = hiResCamera.settleAndCapture();
+                var score = imageSharpnessScore(image);
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestZ = z;
+                    bestImage = image;
+                }
+            }
+
+            moveNozzleToXyAtZ(hiResMotionNozzle, x, y, bestZ);
+            Packages.java.lang.Thread.sleep(80);
+            bestImage = hiResCamera.settleAndCapture();
+        }
+        finally {
+            setHiResLight(false);
+        }
+        var imageName = outputName || ('target_' + pad(targetIndex + 1, 3)
+            + '_object_' + pad(target.objectIndex, 6)
+            + '_' + timestamp()
+            + '_hires.png');
+        var imageFile = new File(hiResDir, imageName);
+        ImageIO.write(bestImage, 'PNG', imageFile);
+        if (outputDir === null || outputDir === undefined) {
+            target.hiResImageFile = imageFile.getAbsolutePath();
+            target.hiResFocusZ = bestZ;
+            target.hiResSharpnessScore = bestScore;
+        }
+        writeHiResPreview(
+            scanDir,
+            target,
+            targetIndex,
+            totalTargets,
+            imageFile,
+            label + ' HiRes Z ' + bestZ.toFixed(3),
+            x,
+            y,
+            bestZ,
+            bestScore
+        );
+        writeStatus(
+            statusFile,
+            'hires',
+            scanId,
+            targetIndex + 1,
+            totalTargets,
+            label + ' HiRes image saved at Z ' + bestZ.toFixed(3)
+        );
+        print('Saved HiRes image for target ' + (targetIndex + 1)
+            + ': ' + imageFile.getAbsolutePath()
+            + ' best Z=' + bestZ.toFixed(3)
+            + ' sharpness=' + bestScore.toFixed(3));
+        moveNozzleToXyAtZ(hiResMotionNozzle, x, y, travelZ);
         return imageFile;
     }
 
@@ -2958,16 +5677,15 @@ with (imports) {
         camera.moveTo(location);
     }
 
-    function inspectPlacedWell(scanDir, scanId, target, targetIndex, totalTargets, statusFile, topCamera, well, touchCorrection) {
+    function inspectPlacedWell(scanDir, scanId, target, targetIndex, totalTargets, statusFile, hiResCamera, hiResMotionNozzle, well, touchCorrection, focusZ, travelZ) {
         var qaDir = new File(scanDir, 'qa/wells');
         qaDir.mkdirs();
-        var cameraX = well.x - touchCorrection.x;
-        var cameraY = well.y - touchCorrection.y;
-        var beforeCameraLocation = topCamera.getLocation();
+        var cameraX = Number(well.qaCameraX);
+        var cameraY = Number(well.qaCameraY);
         var imageName = 'well_' + well.name
             + '_target_' + pad(targetIndex + 1, 3)
             + '_' + timestamp()
-            + '_top.png';
+            + '_hires.png';
         var imageFile = new File(qaDir, imageName);
 
         writeStatus(
@@ -2976,27 +5694,38 @@ with (imports) {
             scanId,
             targetIndex + 1,
             totalTargets,
-            'Moving Top camera over well ' + well.name
+            'Moving HiRes camera over well ' + well.name
                 + ' after drop: camera X ' + cameraX.toFixed(3)
                 + ', Y ' + cameraY.toFixed(3)
         );
-        print('POST-DROP QA: moving Top camera to well ' + well.name
+        print('POST-DROP QA: moving HiRes camera to well ' + well.name
             + ' at camera X=' + cameraX.toFixed(3)
             + ' Y=' + cameraY.toFixed(3)
             + ' to inspect N1 drop point X=' + well.x.toFixed(3)
             + ' Y=' + well.y.toFixed(3)
-            + ' using inverse pick correction dX=' + (-touchCorrection.x).toFixed(3)
-            + ' dY=' + (-touchCorrection.y).toFixed(3)
-            + ' from pick correction source=' + touchCorrection.source);
-        print('POST-DROP QA: Top camera before move: ' + formatLocation(beforeCameraLocation)
-            + ' delta X=' + (cameraX - beforeCameraLocation.x).toFixed(3)
-            + ' delta Y=' + (cameraY - beforeCameraLocation.y).toFixed(3));
-        moveCameraToXy(topCamera, cameraX, cameraY);
-        print('POST-DROP QA: Top camera after move: ' + formatLocation(topCamera.getLocation()));
-        var image = topCamera.settleAndCapture();
-        ImageIO.write(image, 'PNG', imageFile);
+            + ' using plate HiRes camera coordinate'
+            + '; BugPicker XY correction source=' + touchCorrection.source);
+        moveNozzleToXyAtZ(hiResMotionNozzle, hiResMotionNozzle.location.x, hiResMotionNozzle.location.y, travelZ);
+        moveNozzleToXyAtZ(hiResMotionNozzle, cameraX, cameraY, travelZ);
+        var capturedImageFile = captureBestHiResImage(
+            scanDir,
+            scanId,
+            target,
+            targetIndex,
+            totalTargets,
+            hiResCamera,
+            hiResMotionNozzle,
+            cameraX,
+            cameraY,
+            focusZ,
+            travelZ,
+            statusFile,
+            'Well QA ' + well.name,
+            qaDir,
+            imageName
+        );
         print('POST-DROP QA: saved well inspection image: ' + imageFile.getAbsolutePath());
-        var result = runQaInspection(scanDir, imageFile, 'well', targetIndex);
+        var result = runQaInspection(scanDir, capturedImageFile, 'well', targetIndex);
         print('Well QA for ' + well.name
             + ': empty=' + result.well_empty
             + ' bug_present=' + result.bug_present
@@ -3008,19 +5737,20 @@ with (imports) {
             target,
             targetIndex,
             totalTargets,
-            imageFile,
+            capturedImageFile,
             'Well QA ' + well.name + (result.well_empty ? ' | empty' : ' | occupied'),
             cameraX,
             cameraY,
-            topCamera.getLocation().z,
+            Math.max(hiResMinimumZ, Number(focusZ)),
             result
         );
         Packages.java.lang.Thread.sleep(1500);
+        moveNozzleToXyAtZ(hiResMotionNozzle, cameraX, cameraY, travelZ);
         return result;
     }
 
     function inspectNozzleAfterEmptyWell(scanDir, scanId, target, targetIndex, totalTargets, nozzle, travelZ) {
-        var imageFile = inspectPickedTargetOnBottomCamera(
+        var inspection = inspectPickedTargetOnBottomCamera(
             scanDir,
             scanId,
             target,
@@ -3029,7 +5759,7 @@ with (imports) {
             nozzle,
             travelZ
         );
-        var result = runQaInspection(scanDir, imageFile, 'nozzle', targetIndex);
+        var result = runQaInspection(scanDir, inspection.fullImageFile, 'nozzle', targetIndex);
         print('Nozzle QA after empty well for target ' + (targetIndex + 1)
             + ': bug_present=' + result.bug_present
             + ' largest_area=' + Number(result.largest_area_px).toFixed(1)
@@ -3040,7 +5770,7 @@ with (imports) {
             target,
             targetIndex,
             totalTargets,
-            imageFile,
+            inspection.cropImageFile,
             'Nozzle QA Target ' + (targetIndex + 1) + (result.bug_present ? ' | stuck bug' : ' | clear'),
             0,
             0,
@@ -3105,8 +5835,8 @@ with (imports) {
         Packages.java.lang.Thread.sleep(250);
     }
 
-    function recoveryPlateWipeOnly(nozzle, vacuumActuator, travelZ, targetIndex, totalTargets, statusFile, scanId) {
-        var recoveryWell = recoveryWellLocationForIndex(targetIndex);
+    function recoveryPlateWipeOnly(nozzle, vacuumActuator, travelZ, recoveryWellIndex, targetIndex, totalTargets, statusFile, scanId, plateContext) {
+        var recoveryWell = recoveryWellLocationForIndex(recoveryWellIndex, plateContext);
         var wipeZ = -42.0;
         writeStatus(
             statusFile,
@@ -3118,6 +5848,7 @@ with (imports) {
         );
         print('Moving N1 to recovery plate well ' + recoveryWell.name
             + ' for post-plate cleaning wipe'
+            + ' mapped from plate well index ' + recoveryWellIndex
             + ' at X=' + recoveryWell.x.toFixed(3)
             + ' Y=' + recoveryWell.y.toFixed(3)
             + ' travel Z=' + travelZ.toFixed(3)
@@ -3170,6 +5901,29 @@ with (imports) {
         nozzle.moveTo(nozzleLocationAt(nozzle, x, y, z));
     }
 
+    function moveNozzleToXyAtZWithSpeed(nozzle, x, y, z, speed) {
+        var location = nozzleLocationAt(nozzle, x, y, z);
+        try {
+            nozzle.moveTo(location, Number(speed));
+        }
+        catch (speedError) {
+            print('Speed-limited nozzle move was not accepted by OpenPnP; using default speed: ' + speedError);
+            nozzle.moveTo(location);
+        }
+    }
+
+    function twoStagePickDescent(nozzle, x, y, startZ, pickZ) {
+        var slowFraction = 0.10;
+        var slowSpeed = 0.25;
+        var zTravel = pickZ - startZ;
+        var slowStartZ = startZ + (zTravel * (1.0 - slowFraction));
+        print('Two-stage pick descent: fast to Z=' + slowStartZ.toFixed(3)
+            + ', then final ' + Math.abs(pickZ - slowStartZ).toFixed(3)
+            + 'mm at ' + Math.round(slowSpeed * 100) + '% speed to Z=' + pickZ.toFixed(3));
+        moveNozzleToXyAtZ(nozzle, x, y, slowStartZ);
+        moveNozzleToXyAtZWithSpeed(nozzle, x, y, pickZ, slowSpeed);
+    }
+
     function moveNozzleToXyAtZAndRotation(nozzle, x, y, z, rotation) {
         nozzle.moveTo(nozzleLocationAtRotation(nozzle, x, y, z, rotation));
     }
@@ -3196,12 +5950,41 @@ with (imports) {
         }
     }
 
-    function waitForSegmentation(scanDir, timeoutMs) {
+    function waitForSegmentation(scanDir, timeoutMs, stopFile, statusFile, scanId, frameIndex, totalFrames, process, controlDir) {
         var completeFile = new File(scanDir, 'segmentation_complete.json');
+        var stderrLog = new File(controlDir, 'segmentation.err.log');
         var start = new Date().getTime();
+        if (process === null) {
+            print('Segmentation process was not started.');
+            print('See segmentation error log: ' + stderrLog.getAbsolutePath());
+            writeStatus(statusFile, 'failed', scanId, frameIndex, totalFrames, 'Segmentation did not start; see control/segmentation.err.log');
+            return false;
+        }
         while (!completeFile.exists()) {
+            if (haltRequested(stopFile, statusFile, scanId, frameIndex, totalFrames)) {
+                try {
+                    process.destroy();
+                }
+                catch (destroyError) {
+                    print('Could not stop segmentation process after halt: ' + destroyError);
+                }
+                return false;
+            }
+            try {
+                if (!process.isAlive()) {
+                    print('Segmentation process exited before completion with code ' + process.exitValue() + '.');
+                    print('See segmentation error log: ' + stderrLog.getAbsolutePath());
+                    writeStatus(statusFile, 'failed', scanId, frameIndex, totalFrames, 'Segmentation exited before completion; see control/segmentation.err.log');
+                    return false;
+                }
+            }
+            catch (processError) {
+                print('Could not inspect segmentation process state: ' + processError);
+            }
             if ((new Date().getTime() - start) > timeoutMs) {
                 print('Timed out waiting for segmentation: ' + completeFile.getAbsolutePath());
+                print('See segmentation error log: ' + stderrLog.getAbsolutePath());
+                writeStatus(statusFile, 'failed', scanId, frameIndex, totalFrames, 'Timed out waiting for target segmentation');
                 return false;
             }
             Packages.java.lang.Thread.sleep(500);
@@ -3218,6 +6001,32 @@ with (imports) {
             Packages.java.lang.Thread.sleep(250);
         }
         return false;
+    }
+
+    function pickCoordinatesFromRecord(record) {
+        var sortingTrayPickXCorrectionMm = 23.5;
+        var sortingTrayPickYCorrectionMm = 0.5;
+        var pickXSource = 'estimated_x_mm';
+        var pickX = record.requested_frame_estimated_x_mm !== undefined
+            ? (pickXSource = 'requested_frame_estimated_x_mm + sorting tray X correction',
+                Number(record.requested_frame_estimated_x_mm) + sortingTrayPickXCorrectionMm)
+            : record.pick_x_mm !== undefined
+            ? (pickXSource = 'pick_x_mm + sorting tray X correction',
+                Number(record.pick_x_mm) + sortingTrayPickXCorrectionMm)
+            : Number(record.estimated_x_mm) + sortingTrayPickXCorrectionMm;
+        var pickYSource = 'estimated_y_mm';
+        var pickY = record.pick_y_mm !== undefined
+            ? (pickYSource = 'pick_y_mm + sorting tray Y correction',
+                Number(record.pick_y_mm) + sortingTrayPickYCorrectionMm)
+            : record.requested_frame_estimated_y_mm !== undefined
+            ? (pickYSource = 'requested_frame_estimated_y_mm + sorting tray Y correction',
+                Number(record.requested_frame_estimated_y_mm) + sortingTrayPickYCorrectionMm)
+            : Number(record.estimated_y_mm) + sortingTrayPickYCorrectionMm;
+        return {
+            x: pickX,
+            y: pickY,
+            source: pickXSource + ' / ' + pickYSource
+        };
     }
 
     function readPickTargets(scanDir, quiet, includeDebris, includeUnsafe, requireReviewedPicks) {
@@ -3240,8 +6049,9 @@ with (imports) {
                 if (line.length > 0) {
                     try {
                         var record = JSON.parse(line);
-                        var pickX = record.pick_x_mm !== undefined ? record.pick_x_mm : record.estimated_x_mm;
-                        var pickY = record.pick_y_mm !== undefined ? record.pick_y_mm : record.estimated_y_mm;
+                        var pickCoordinates = pickCoordinatesFromRecord(record);
+                        var pickX = pickCoordinates.x;
+                        var pickY = pickCoordinates.y;
                         if (pickX !== undefined && pickY !== undefined) {
                             var objectIndex = record.object_index;
                             var decision = decisions[String(objectIndex)];
@@ -3256,7 +6066,7 @@ with (imports) {
                                 }
                             }
                             else {
-                                targets.push(makePickTarget(record, pickX, pickY, decision, false));
+                                targets.push(makePickTarget(record, pickX, pickY, decision, false, pickCoordinates.source));
                             }
                         }
                     }
@@ -3277,11 +6087,21 @@ with (imports) {
         });
         markUnsafeCloseTargets(targets, 2.5);
         markUnsafeCloseCandidates(scanDir, targets, 2.5);
-        markUnsafeMergedFootprints(targets);
+        // Large specimens should be reviewed by the operator, not silently excluded
+        // from picking. Close-neighbor targets still remain unsafe.
         if (!includeUnsafe) {
             targets = filterUnsafeTargets(targets, quiet);
         }
         targets.sort(function(a, b) {
+            if (a.collectionEventSlot !== b.collectionEventSlot) {
+                return a.collectionEventSlot - b.collectionEventSlot;
+            }
+            if (a.sortingTraySlot !== b.sortingTraySlot) {
+                return a.sortingTraySlot - b.sortingTraySlot;
+            }
+            if (a.frameIndex !== b.frameIndex) {
+                return a.frameIndex - b.frameIndex;
+            }
             if (a.y === b.y) {
                 return a.x - b.x;
             }
@@ -3290,7 +6110,7 @@ with (imports) {
         return targets;
     }
 
-    function makePickTarget(record, pickX, pickY, decision, recoveredDuplicate) {
+    function makePickTarget(record, pickX, pickY, decision, recoveredDuplicate, coordinateSource) {
         return {
             objectIndex: recoveredDuplicate
                 ? Number(record.candidate_index !== undefined ? record.candidate_index : record.object_index) + 1000000
@@ -3301,7 +6121,15 @@ with (imports) {
             isDuplicate: Boolean(record.is_duplicate),
             recoveredDuplicate: Boolean(recoveredDuplicate),
             coordinateTransformVersion: String(record.coordinate_transform_version || ''),
+            coordinateSource: String(coordinateSource || ''),
             frameIndex: Number(record.frame_index || 0),
+            sortingTraySlot: Number(record.sorting_tray_slot || 1),
+            collectionEventSlot: Number(record.collection_event_slot || 1),
+            plateSlot: Number(record.plate_slot || 1),
+            recoverySlot: Number(record.recovery_slot || 1),
+            trayPickZMm: Number(record.tray_pick_z_mm),
+            trayHeightMm: Number(record.tray_height_mm),
+            traySizeClass: String(record.tray_size_class || ''),
             x: Number(pickX),
             y: Number(pickY),
             estimatedX: Number(record.estimated_x_mm),
@@ -3361,8 +6189,9 @@ with (imports) {
                             var originalDecision = decisions[String(record.object_index)];
                             var duplicateOfDecision = decisions[String(record.duplicate_of_object_index)];
                             var decision = recoveredDecision || originalDecision || duplicateOfDecision;
-                            var pickX = record.pick_x_mm !== undefined ? record.pick_x_mm : record.estimated_x_mm;
-                            var pickY = record.pick_y_mm !== undefined ? record.pick_y_mm : record.estimated_y_mm;
+                            var pickCoordinates = pickCoordinatesFromRecord(record);
+                            var pickX = pickCoordinates.x;
+                            var pickY = pickCoordinates.y;
                             var explicitlyApproved = recoveredDecision && recoveredDecision.pick === true;
                             var relatedDebris = (originalDecision && originalDecision.pick === false)
                                 || (duplicateOfDecision && duplicateOfDecision.pick === false);
@@ -3386,7 +6215,7 @@ with (imports) {
                                     }
                                 }
                                 else if (distanceToNearestTarget(Number(pickX), Number(pickY), targets) >= recoveryDistanceMm) {
-                                    targets.push(makePickTarget(record, pickX, pickY, decision, true));
+                                    targets.push(makePickTarget(record, pickX, pickY, decision, true, pickCoordinates.source));
                                     recoveredCount++;
                                 }
                             }
@@ -3510,8 +6339,9 @@ with (imports) {
                 if (line.length > 0) {
                     try {
                         var record = JSON.parse(line);
-                        var pickX = record.pick_x_mm !== undefined ? record.pick_x_mm : record.estimated_x_mm;
-                        var pickY = record.pick_y_mm !== undefined ? record.pick_y_mm : record.estimated_y_mm;
+                        var pickCoordinates = pickCoordinatesFromRecord(record);
+                        var pickX = pickCoordinates.x;
+                        var pickY = pickCoordinates.y;
                         if (pickX !== undefined && pickY !== undefined) {
                             candidates.push({
                                 objectIndex: record.object_index,
@@ -3630,15 +6460,37 @@ with (imports) {
         return String.fromCharCode('A'.charCodeAt(0) + rowIndex) + String(columnIndex + 1);
     }
 
-    function wellLocationForIndex(index) {
+    function wellLocationForIndex(index, plateContext) {
         if (index < 0 || index >= 96) {
             throw new Error('96-well plate only has room for 96 targets; requested well index ' + index);
         }
 
-        var calibration = loadTrainingTrayCalibration(defaultTrainingTrayCalibrationValues());
-        var a1X = Number(calibration.plateA1X);
-        var a1Y = Number(calibration.plateA1Y);
-        var wellPitch = Number(calibration.plateWellPitchMm);
+        var calibration = plateContext ? null : loadTrainingTrayCalibration(defaultTrainingTrayCalibrationValues());
+        var a1X = plateContext ? Number(plateContext.plateA1X) : Number(calibration.plateA1X);
+        var a1Y = plateContext ? Number(plateContext.plateA1Y) : Number(calibration.plateA1Y);
+        var wellPitch = plateContext ? Number(plateContext.plateWellPitchMm) : Number(calibration.plateWellPitchMm);
+        var rowIndex = Math.floor(index / 12);
+        var columnIndex = index % 12;
+        var qaCamera = wellQaCameraLocationForIndex(index, plateContext);
+
+        return {
+            name: wellNameForIndex(index),
+            x: a1X + (wellPitch * rowIndex),
+            y: a1Y + (wellPitch * columnIndex),
+            qaCameraX: qaCamera.x,
+            qaCameraY: qaCamera.y
+        };
+    }
+
+    function wellQaCameraLocationForIndex(index, plateContext) {
+        if (index < 0 || index >= 96) {
+            throw new Error('96-well plate only has room for 96 targets; requested well index ' + index);
+        }
+
+        var calibration = plateContext ? null : loadTrainingTrayCalibration(defaultTrainingTrayCalibrationValues());
+        var a1X = plateContext ? Number(plateContext.plateQaCameraA1X) : Number(calibration.plateQaCameraA1X);
+        var a1Y = plateContext ? Number(plateContext.plateQaCameraA1Y) : Number(calibration.plateQaCameraA1Y);
+        var wellPitch = plateContext ? Number(plateContext.plateWellPitchMm) : Number(calibration.plateWellPitchMm);
         var rowIndex = Math.floor(index / 12);
         var columnIndex = index % 12;
 
@@ -3649,15 +6501,15 @@ with (imports) {
         };
     }
 
-    function recoveryWellLocationForIndex(index) {
+    function recoveryWellLocationForIndex(index, plateContext) {
         if (index < 0 || index >= 96) {
             throw new Error('Recovery plate only has room for 96 targets; requested well index ' + index);
         }
 
-        var calibration = loadTrainingTrayCalibration(defaultTrainingTrayCalibrationValues());
-        var a1X = 93.0;
-        var a1Y = 287.0;
-        var wellPitch = Number(calibration.plateWellPitchMm);
+        var calibration = plateContext ? null : loadTrainingTrayCalibration(defaultTrainingTrayCalibrationValues());
+        var a1X = plateContext ? Number(plateContext.recoveryPlateA1X) : Number(calibration.recoveryPlateA1X);
+        var a1Y = plateContext ? Number(plateContext.recoveryPlateA1Y) : Number(calibration.recoveryPlateA1Y);
+        var wellPitch = plateContext ? Number(plateContext.plateWellPitchMm) : Number(calibration.plateWellPitchMm);
         var rowIndex = Math.floor(index / 12);
         var columnIndex = index % 12;
 
@@ -3668,7 +6520,7 @@ with (imports) {
         };
     }
 
-    function pickAndDropTargets(scanDir, pauseFile, stopFile, statusFile, scanId, totalFrames, plateContext, wellQueue) {
+    function pickAndDropTargets(scanDir, pauseFile, stopFile, statusFile, scanId, totalFrames, plateContext, wellQueue, targetStartIndex, plateSlotFilter) {
         var pickHeadName = 'H1';
         var pickNozzleName = 'N1';
         var pickNozzleLabel = 'left nozzle N1';
@@ -3676,48 +6528,84 @@ with (imports) {
         var dryRun = dryRunFile.exists();
         var pickTool = findPickTool(pickHeadName, pickNozzleName);
         var nozzle = pickTool.nozzle;
+        var hiResCamera = findHiResCamera();
         var vacuumActuator = findVacuumActuator(pickTool.head, nozzle);
         var topCamera = findCameraByName('Top');
         var travelZ = nozzle.location.z;
+        var hiResTravelZ = travelZ;
         var touchCorrection = readTouchCorrection();
         var trayCalibration = loadTrainingTrayCalibration(defaultTrainingTrayCalibrationValues());
-        var pickZ = Number(trayCalibration.pickZMm);
+        var defaultPickZ = Number(trayCalibration.pickZMm);
+        var hiResFocusZ = isNaN(Number(trayCalibration.hiResFocusZMm)) ? hiResFocusCenterZ : Number(trayCalibration.hiResFocusZMm);
+        var hiResOffsetX = Number(plateContext.plateQaCameraA1X) - Number(plateContext.plateA1X);
+        var hiResOffsetY = Number(plateContext.plateQaCameraA1Y) - Number(plateContext.plateA1Y);
         var dropZ = -33.5;
-        var targets = readPickTargets(scanDir, false, false, false, true);
+        var targets = readPickTargets(scanDir, false, false, false, reviewDecisionFile(scanDir).exists());
+        if (plateSlotFilter !== undefined && plateSlotFilter !== null) {
+            var filteredTargets = [];
+            for (var filterIndex = 0; filterIndex < targets.length; filterIndex++) {
+                if (Number(targets[filterIndex].plateSlot || 1) === Number(plateSlotFilter)) {
+                    filteredTargets.push(targets[filterIndex]);
+                }
+            }
+            targets = filteredTargets;
+        }
+        var startTargetIndex = Math.max(0, Number(targetStartIndex || 0));
+        if (startTargetIndex > targets.length) {
+            startTargetIndex = targets.length;
+        }
         var availableWells = wellQueue || wellQueueFromStart(plateContext);
-        var targetLimit = Math.min(targets.length, availableWells.length);
+        var remainingTargetCount = Math.max(0, targets.length - startTargetIndex);
+        var targetLimit = Math.min(remainingTargetCount, availableWells.length);
         var emptyWells = [];
+        var result = {
+            emptyWells: emptyWells,
+            attemptedWells: 0,
+            targetsFound: targets.length,
+            availableWells: availableWells.length,
+            targetStartIndex: startTargetIndex,
+            nextTargetIndex: startTargetIndex,
+            remainingTargets: remainingTargetCount
+        };
 
-        print('Pick sequence has ' + targets.length + ' unique target(s).');
+        print('Pick sequence has ' + targets.length + ' unique target(s); starting at target '
+            + (startTargetIndex + 1) + '.');
         print('Plate context: plate=' + plateContext.plateNumber
             + ' plate_id=' + plateContext.plateId
             + ' collection=' + plateContext.collectionCode
+            + ' plate_slot=' + plateContext.plateSlot
+            + ' recovery_slot=' + plateContext.recoverySlot
             + ' available wells=' + availableWells.length
             + ' target limit=' + targetLimit);
         print('Pick tool is ' + pickNozzleLabel + ' on head ' + pickHeadName
             + '; travel Z for XY moves: ' + travelZ.toFixed(3));
-        print('Pick correction: dX=' + touchCorrection.x.toFixed(3)
+        print('BugPicker XY correction disabled: dX=' + touchCorrection.x.toFixed(3)
             + ' dY=' + touchCorrection.y.toFixed(3)
             + ' source=' + touchCorrection.source);
         print('Tray height preset: ' + Number(trayCalibration.trayHeightMm).toFixed(3)
             + ' mm; size class=' + trayCalibration.sizeClass
-            + '; N1 pick Z=' + pickZ.toFixed(3)
+            + '; default N1 pick Z=' + defaultPickZ.toFixed(3)
             + '; source=' + trayCalibration.source);
-        print('Dual-nozzle Z prediction: N1 pick Z=' + pickZ.toFixed(3)
-            + ' would put N2 at Z=' + n2ZWhenN1Z(pickZ).toFixed(3));
+        print('Dual-nozzle Z prediction: default N1 pick Z=' + defaultPickZ.toFixed(3)
+            + ' would put N2 at Z=' + n2ZWhenN1Z(defaultPickZ).toFixed(3));
         print('N1 drop Z=' + dropZ.toFixed(3));
+        print('HiRes camera selected: ' + hiResCamera.getName()
+            + '; N1-frame travel Z=' + Number(hiResTravelZ).toFixed(3)
+            + '; focus center Z=' + hiResFocusZ.toFixed(3)
+            + '; A1-derived HiRes offset from picker dX=' + hiResOffsetX.toFixed(3)
+            + ' dY=' + hiResOffsetY.toFixed(3));
         if (dryRun) {
             print('Pick dry run flag is present: ' + dryRunFile.getAbsolutePath());
         }
-        if (targets.length === 0) {
+        if (targets.length === 0 || remainingTargetCount === 0) {
             parkPickerAtBottomInspectionHome(nozzle, travelZ);
-            writeStatus(statusFile, 'completed', scanId, totalFrames, totalFrames, 'Scan completed; no pick targets found');
-            return emptyWells;
+            writeStatus(statusFile, 'completed', scanId, totalFrames, totalFrames, 'Scan completed; no remaining pick targets found');
+            return result;
         }
         if (targetLimit === 0) {
             parkPickerAtBottomInspectionHome(nozzle, travelZ);
             writeStatus(statusFile, 'completed', scanId, totalFrames, totalFrames, 'Scan completed; no wells available to fill');
-            return emptyWells;
+            return result;
         }
         if (targets.length > availableWells.length) {
             print('Found ' + targets.length + ' pick targets but only ' + availableWells.length
@@ -3728,39 +6616,69 @@ with (imports) {
             if (!waitWhilePaused(pauseFile, stopFile, statusFile, scanId, i, targets.length)
                     || haltRequested(stopFile, statusFile, scanId, i, targets.length)) {
                 print('Halt requested during pick sequence. Stopping before target ' + (i + 1) + '.');
-                return emptyWells;
+                return result;
             }
 
-            var target = targets[i];
+            result.attemptedWells = i + 1;
+            var targetIndex = startTargetIndex + i;
+            result.nextTargetIndex = targetIndex + 1;
+            result.remainingTargets = Math.max(0, targets.length - result.nextTargetIndex);
+            var target = targets[targetIndex];
+            var pickZ = isNaN(Number(target.trayPickZMm)) ? defaultPickZ : Number(target.trayPickZMm);
             var moveX = target.x + touchCorrection.x;
             var moveY = target.y + touchCorrection.y;
-            var well = wellLocationForIndex(Number(availableWells[i]));
-            writePickingPreview(scanDir, scanId, target, i, targetLimit, moveX, moveY);
+            var hiResTargetX = moveX + hiResOffsetX;
+            var hiResTargetY = moveY + hiResOffsetY;
+            var wellIndex = Number(availableWells[i]);
+            if (isReservedPlateWellIndex(wellIndex)) {
+                throw new Error('Refusing to move toward reserved negative control well '
+                    + RESERVED_NEGATIVE_CONTROL_WELL + '.');
+            }
+            var well = wellLocationForIndex(wellIndex, plateContext);
+            writePickingPreview(scanDir, scanId, target, targetIndex, targets.length, moveX, moveY);
             writeStatus(
                 statusFile,
                 'picking',
                 scanId,
-                i + 1,
-                targetLimit,
-                'Picking target ' + (i + 1) + ' for well ' + well.name
+                targetIndex + 1,
+                targets.length,
+                'Picking target ' + (targetIndex + 1) + ' for well ' + well.name
                     + ' at X ' + moveX.toFixed(3) + ', Y ' + moveY.toFixed(3)
             );
 
             debugPickTarget(scanDir, target, nozzle, travelZ, dryRun, touchCorrection, moveX, moveY);
             if (dryRun) {
-                writeStatus(statusFile, 'paused', scanId, i + 1, targetLimit, 'Dry run stopped above first pick target');
-                return emptyWells;
+                writeStatus(statusFile, 'paused', scanId, targetIndex + 1, targets.length, 'Dry run stopped above first pick target');
+                return result;
             }
+
+            var hiResImageFile = captureBestHiResImage(
+                scanDir,
+                scanId,
+                target,
+                targetIndex,
+                targets.length,
+                hiResCamera,
+                nozzle,
+                hiResTargetX,
+                hiResTargetY,
+                hiResFocusZ,
+                hiResTravelZ,
+                statusFile,
+                'Target ' + (targetIndex + 1)
+            );
 
             print('Moving ' + pickNozzleLabel + ' above object ' + target.objectIndex
                 + ' using corrected scan coordinates X=' + moveX.toFixed(3)
                 + ' Y=' + moveY.toFixed(3)
+                + ' source=' + target.coordinateSource
                 + ' at travel Z=' + travelZ.toFixed(3));
             moveNozzleToXyAtZ(nozzle, moveX, moveY, travelZ);
 
             print('Starting assumed-success net-tray pick for object ' + target.objectIndex
                 + ' at X=' + moveX.toFixed(3)
                 + ' Y=' + moveY.toFixed(3)
+                + ' tray=' + target.sortingTraySlot
                 + ' Z=' + pickZ.toFixed(3));
             pickAssumingSuccess(
                 scanDir,
@@ -3770,23 +6688,25 @@ with (imports) {
                 moveX,
                 moveY,
                 pickZ,
-                i,
+                targetIndex,
                 scanId,
-                targetLimit
+                targets.length
             );
             moveNozzleToXyAtZ(nozzle, moveX, moveY, travelZ);
 
-            var bottomInspectionImage = inspectPickedTargetOnBottomCamera(
+            var bottomInspection = inspectPickedTargetOnBottomCamera(
                 scanDir,
                 scanId,
                 target,
-                i,
-                targetLimit,
+                targetIndex,
+                targets.length,
                 nozzle,
                 travelZ
             );
-            var nozzleQa = runQaInspection(scanDir, bottomInspectionImage, 'nozzle', i);
-            print('Bottom-camera nozzle QA for target ' + (i + 1)
+            var bottomInspectionImage = bottomInspection.cropImageFile;
+            var bottomInspectionQaImage = bottomInspection.fullImageFile;
+            var nozzleQa = runQaInspection(scanDir, bottomInspectionQaImage, 'nozzle', targetIndex);
+            print('Bottom-camera nozzle QA for target ' + (targetIndex + 1)
                 + ': bug_present=' + nozzleQa.bug_present
                 + ' possible_multiple=' + nozzleQa.possible_multiple
                 + ' component_count=' + nozzleQa.component_count
@@ -3797,31 +6717,16 @@ with (imports) {
                     statusFile,
                     'qa',
                     scanId,
-                    i + 1,
-                    targetLimit,
-                    'Skipping well drop for target ' + (i + 1)
+                    targetIndex + 1,
+                    targets.length,
+                    'Bottom camera flagged target ' + (targetIndex + 1)
                         + ': bottom camera '
                         + (!nozzleQa.bug_present ? 'did not confirm a specimen' : 'saw possible multiple specimens')
+                        + '; continuing to plate anyway'
                 );
-                print('Skipping well drop for target ' + (i + 1)
+                print('Bottom-camera nozzle QA would have rejected target ' + (targetIndex + 1)
                     + ' object ' + target.objectIndex
-                    + ' based on bottom-camera nozzle QA.');
-                recoveryPlateWipeOnly(
-                    nozzle,
-                    vacuumActuator,
-                    travelZ,
-                    i,
-                    targetLimit,
-                    statusFile,
-                    scanId
-                );
-                emptyWells.push({
-                    index: Number(availableWells[i]),
-                    name: well.name,
-                    imageFile: null,
-                    reason: !nozzleQa.bug_present ? 'no specimen on nozzle' : 'possible multiple specimens on nozzle'
-                });
-                continue;
+                    + ', but BugPicker is configured to attempt plating every pick to avoid false negatives.');
             }
 
             print('Moving ' + pickNozzleLabel + ' above well ' + well.name
@@ -3847,56 +6752,146 @@ with (imports) {
                 statusFile,
                 'qa',
                 scanId,
-                i + 1,
-                targetLimit,
-                'Checking well ' + well.name + ' after placing target ' + (i + 1)
+                targetIndex + 1,
+                targets.length,
+                'Checking well ' + well.name + ' after placing target ' + (targetIndex + 1)
             );
             var wellQa = inspectPlacedWell(
                 scanDir,
                 scanId,
                 target,
-                i,
-                targetLimit,
+                targetIndex,
+                targets.length,
                 statusFile,
-                topCamera,
+                hiResCamera,
+                nozzle,
                 well,
-                touchCorrection
+                touchCorrection,
+                hiResFocusZ,
+                hiResTravelZ
             );
             var wellImageFile = new File(String(wellQa.image || ''));
-            copyPlateWellImage(plateContext, well, wellImageFile);
             if (wellQa.well_empty) {
                 emptyWells.push({
                     index: Number(availableWells[i]),
                     name: well.name,
                     imageFile: wellImageFile,
+                    hiResImageFile: hiResImageFile,
+                    bottomImageFile: bottomInspectionImage,
+                    target: target,
+                    targetIndex: targetIndex,
                     reason: 'QA well empty'
                 });
+                appendPlateAttemptLog(
+                    scanDir,
+                    plateContext,
+                    well,
+                    target,
+                    targetIndex,
+                    hiResImageFile,
+                    bottomInspectionImage,
+                    wellImageFile,
+                    'well QA empty',
+                    'QA well empty',
+                    scanId
+                );
                 writeStatus(
                     statusFile,
                     'qa',
                     scanId,
-                    i + 1,
-                    targetLimit,
+                    targetIndex + 1,
+                    targets.length,
                     'Well ' + well.name + ' appears empty; moving to recovery plate'
                 );
             }
             else {
-                appendPlateSpreadsheetRow(plateContext, well);
+                var traceMetadata = plateTraceMetadata(
+                    scanDir,
+                    scanId,
+                    target,
+                    targetIndex,
+                    hiResImageFile,
+                    bottomInspectionImage,
+                    wellImageFile,
+                    'well QA occupied'
+                );
+                copyPlateSpecimenImages(scanDir, plateContext, well, target, hiResImageFile, bottomInspectionImage, wellImageFile);
+                appendPlateSpreadsheetRow(plateContext, well, traceMetadata);
+                appendPlateAttemptLog(
+                    scanDir,
+                    plateContext,
+                    well,
+                    target,
+                    targetIndex,
+                    hiResImageFile,
+                    bottomInspectionImage,
+                    wellImageFile,
+                    'well QA occupied',
+                    '',
+                    scanId
+                );
             }
             recoveryPlateWipeOnly(
                 nozzle,
                 vacuumActuator,
                 travelZ,
-                i,
-                targetLimit,
+                Number(availableWells[i]),
+                targetIndex,
+                targets.length,
                 statusFile,
-                scanId
+                scanId,
+                plateContext
             );
         }
 
-        parkPickerAtBottomInspectionHome(nozzle, travelZ);
-        writeStatus(statusFile, 'completed', scanId, totalFrames, totalFrames, 'Scan and pick/drop sequence completed');
-        return emptyWells;
+        parkHeadAtMaxXy(topCamera, pickTool.head);
+        writeStatus(statusFile, 'running', scanId, totalFrames, totalFrames, 'Pick/drop pass completed; waiting for refill decisions');
+        return result;
+    }
+
+    function pickAndDropPlateContexts(scanDir, pauseFile, stopFile, statusFile, scanId, totalFrames, plateContexts) {
+        var aggregate = {
+            emptyWells: [],
+            attemptedWells: 0,
+            targetsFound: 0,
+            availableWells: 0,
+            targetStartIndex: 0,
+            nextTargetIndex: 0,
+            remainingTargets: 0
+        };
+        for (var contextIndex = 0; contextIndex < plateContexts.length; contextIndex++) {
+            var context = plateContexts[contextIndex];
+            var queue = wellQueueFromStart(context);
+            if (queue.length === 0) {
+                print('Skipping plate ' + context.plateNumber
+                    + ' slot ' + context.plateSlot
+                    + ': no available wells at or after ' + context.startWell + '.');
+                continue;
+            }
+            print('Starting plate slot ' + context.plateSlot
+                + ' using collection ' + context.collectionCode
+                + ' into plate ' + context.plateNumber
+                + ' with recovery slot ' + context.recoverySlot + '.');
+            var result = pickAndDropTargets(
+                scanDir,
+                pauseFile,
+                stopFile,
+                statusFile,
+                scanId,
+                totalFrames,
+                context,
+                queue,
+                0,
+                context.plateSlot
+            );
+            aggregate.emptyWells = aggregate.emptyWells.concat(result.emptyWells);
+            aggregate.attemptedWells += result.attemptedWells;
+            aggregate.targetsFound += result.targetsFound;
+            aggregate.availableWells += result.availableWells;
+            aggregate.remainingTargets += result.remainingTargets;
+            aggregate.nextTargetIndex = result.nextTargetIndex;
+        }
+        return aggregate;
     }
 
     task(function() {
@@ -3908,20 +6903,56 @@ with (imports) {
         var calibrationPickTool = findPickTool('H1', 'N1');
 
         var calibration = loadTrainingTrayCalibration(defaultTrainingTrayCalibrationValues());
+        calibration = promptForMultiRunSetup(calibration);
         calibration = promptForTrainingTrayBounds(calibration, camera, calibrationPickTool.nozzle);
         print('Calibration dialog accepted; raising nozzles back to safe travel height before scan.');
         parkNozzlesForScan(machine.defaultHead);
-        var xLeft = calibration.xLeft;
-        var xRight = calibration.xRight;
-        var yTop = calibration.yTop;
-        var fullYBottom = calibration.yBottom;
-        var yBottom = fullYBottom;
         var cameraXOffsetMm = calibration.cameraXOffsetMm;
         var cameraYOffsetMm = calibration.cameraYOffsetMm;
         var xStepMm = calibration.xStepMm;
         var yStepMm = calibration.yStepMm;
-        var plateContext = calibration.plateContext;
-        ensurePlateSpreadsheetHeader(plateContext);
+        var plateContexts = activePlateContexts(calibration.multiConfig);
+        var plateContext = plateContexts[0];
+        var activeScanTrays = activeSortingTrayConfigs(calibration.multiConfig);
+        if (activeScanTrays.length === 0) {
+            JOptionPane.showMessageDialog(
+                null,
+                'No sorting trays are enabled for this run.',
+                'No sorting trays',
+                JOptionPane.ERROR_MESSAGE
+            );
+            return;
+        }
+        for (var existingPlateIndex = 1; existingPlateIndex < plateContexts.length; existingPlateIndex++) {
+            var existingContext = plateContexts[existingPlateIndex];
+            if (plateCsvFile(existingContext.plateNumber).exists()) {
+                var existingRecordedWells = occupiedWellCount(existingContext.plateNumber);
+                var existingChoice = JOptionPane.showOptionDialog(
+                    null,
+                    'A spreadsheet already exists for plate ' + existingContext.plateNumber
+                        + ' with ' + existingRecordedWells + ' recorded well(s).'
+                        + '\n\nContinue from the next unrecorded well, or archive the old CSV and treat this as a fresh plate?',
+                    'Existing plate warning',
+                    JOptionPane.YES_NO_CANCEL_OPTION,
+                    JOptionPane.WARNING_MESSAGE,
+                    null,
+                    Java.to(['Continue existing plate', 'Archive and restart plate', 'Cancel'], 'java.lang.Object[]'),
+                    'Continue existing plate'
+                );
+                if (existingChoice === 1) {
+                    archivePlateSpreadsheet(existingContext.plateNumber);
+                }
+                else if (existingChoice === 0) {
+                    reviewExistingPlateWells(existingContext);
+                }
+                else {
+                    return;
+                }
+            }
+        }
+        for (var plateHeaderIndex = 0; plateHeaderIndex < plateContexts.length; plateHeaderIndex++) {
+            ensurePlateSpreadsheetHeader(plateContexts[plateHeaderIndex]);
+        }
 
         var controlDir = new File(projectDir, 'control');
         var pauseFile = new File(controlDir, 'pause.flag');
@@ -3936,55 +6967,106 @@ with (imports) {
         if (stopFile.exists()) {
             stopFile.delete();
         }
-        launchHaltGui(controlDir);
 
         var pendingWellQueue = wellQueueFromStart(plateContext);
         var refillAttempt = 0;
-        if (pendingWellQueue.length === 0) {
-            JOptionPane.showMessageDialog(
+        if (plateContexts.length > 1) {
+            var anyPlateHasWells = false;
+            for (var pendingContextIndex = 0; pendingContextIndex < plateContexts.length; pendingContextIndex++) {
+                if (wellQueueFromStart(plateContexts[pendingContextIndex]).length > 0) {
+                    anyPlateHasWells = true;
+                }
+            }
+            if (!anyPlateHasWells) {
+                JOptionPane.showMessageDialog(
+                    null,
+                    'No wells are available on any active plate.',
+                    'No wells available',
+                    JOptionPane.ERROR_MESSAGE
+                );
+                return;
+            }
+            pendingWellQueue = [0];
+        }
+        if (plateContexts.length === 1 && pendingWellQueue.length === 0) {
+            var resetChoice = JOptionPane.showOptionDialog(
                 null,
                 'No wells are available at or after ' + plateContext.startWell
-                    + ' for plate ' + plateContext.plateNumber + '.',
+                    + ' for plate ' + plateContext.plateNumber + '.\n\n'
+                    + 'This usually means the plate CSV already records those wells as filled. '
+                    + RESERVED_NEGATIVE_CONTROL_WELL + ' is reserved as the negative control and is never filled.\n'
+                    + 'Archive the old CSV and restart this plate from ' + plateContext.startWell + '?',
                 'No wells available',
-                JOptionPane.INFORMATION_MESSAGE
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.WARNING_MESSAGE,
+                null,
+                Java.to(['Archive old CSV and restart', 'Cancel run'], 'java.lang.Object[]'),
+                'Archive old CSV and restart'
             );
-            return;
+            if (resetChoice !== 0) {
+                return;
+            }
+            archivePlateSpreadsheet(plateContext.plateNumber);
+            ensurePlateSpreadsheetHeader(plateContext);
+            pendingWellQueue = wellQueueFromStart(plateContext);
+            if (pendingWellQueue.length === 0) {
+                JOptionPane.showMessageDialog(
+                    null,
+                    'No wells are available after resetting plate ' + plateContext.plateNumber + '.',
+                    'No wells available',
+                    JOptionPane.ERROR_MESSAGE
+                );
+                return;
+            }
         }
 
         while (pendingWellQueue.length > 0) {
-        print('Preparing for scan/refill attempt; raising nozzles to safe travel height before XY motion.');
-        parkNozzlesForScan(machine.defaultHead);
-        var scanId = 'scan_' + timestamp();
-        if (refillAttempt > 0) {
-            scanId = scanId + '_refill_' + refillAttempt;
-        }
-        var scanDir = new File(outputRoot, scanId);
-        var framesDir = new File(scanDir, 'frames');
-        framesDir.mkdirs();
+            launchHaltGui(controlDir);
+            print('Preparing for scan/refill attempt; raising nozzles to safe travel height before XY motion.');
+            parkNozzlesForScan(machine.defaultHead);
+            var scanId = 'scan_' + timestamp();
+            if (refillAttempt > 0) {
+                scanId = scanId + '_refill_' + refillAttempt;
+            }
+            var scanDir = new File(outputRoot, scanId);
+            var framesDir = new File(scanDir, 'frames');
+            framesDir.mkdirs();
 
-        var manifestFile = new File(scanDir, 'manifest.jsonl');
-        var manifest = new FileWriter(manifestFile);
-        var xs = positions(xLeft, xRight, xStepMm, false);
-        var ys = positions(yTop, yBottom, yStepMm, false);
-        var frameIndex = 0;
-        var totalFrames = xs.length * ys.length;
-        var stopAtFirstTarget = touchDryRunFile.exists() && !interactivePickFile.exists();
-        var stopAfterFirstTarget = false;
-        var interactiveState = null;
+            var manifestFile = new File(scanDir, 'manifest.jsonl');
+            var manifest = new FileWriter(manifestFile);
+            var frameIndex = 0;
+            var totalFrames = 0;
+            for (var trayCountIndex = 0; trayCountIndex < activeScanTrays.length; trayCountIndex++) {
+                totalFrames += scanFrameCountForTray(activeScanTrays[trayCountIndex], xStepMm, yStepMm);
+            }
+            var reviewTargetsBeforePick = true;
+            var stopAtFirstTarget = touchDryRunFile.exists() && !reviewTargetsBeforePick;
+            var stopAfterFirstTarget = false;
+            var interactiveState = null;
 
         print('Starting Top camera scan: ' + scanId);
-        print('This scan will fill wells: ' + pendingWellQueue.map(function(wellIndex) {
-            return wellNameForIndex(Number(wellIndex));
-        }).join(', '));
+        if (plateContexts.length > 1) {
+            for (var scanPlateContextIndex = 0; scanPlateContextIndex < plateContexts.length; scanPlateContextIndex++) {
+                var scanPlateContext = plateContexts[scanPlateContextIndex];
+                print('Plate slot ' + scanPlateContext.plateSlot
+                    + ' will fill open wells starting at ' + scanPlateContext.startWell
+                    + ' for plate ' + scanPlateContext.plateNumber
+                    + ' collection ' + scanPlateContext.collectionCode + '.');
+            }
+        }
+        else {
+            print('This scan will fill wells: ' + pendingWellQueue.map(function(wellIndex) {
+                return wellNameForIndex(Number(wellIndex));
+            }).join(', '));
+        }
         print('Frames directory: ' + framesDir.getAbsolutePath());
-        print('Scan test area: X=' + xLeft.toFixed(3) + '..' + xRight.toFixed(3)
-            + ' Y=' + yTop.toFixed(3) + '..' + yBottom.toFixed(3)
-            + ' (full calibrated Y range)');
+        print('Scanning ' + activeScanTrays.length + ' sorting tray(s).');
         print('Scan overlap step: X step=' + xStepMm.toFixed(3)
             + ' Y step=' + yStepMm.toFixed(3));
-        print('Grid: ' + xs.length + ' columns x ' + ys.length + ' rows');
+        print('Grid total: ' + totalFrames + ' frame(s) across enabled tray(s).');
         print('Training tray calibration source: ' + calibration.source);
         print('Scan bounds are camera coordinates: ' + calibration.scanBoundsAreCameraCoordinates);
+        print('Python for BugPicker helpers: ' + python);
         print('Stop at first detected target: ' + stopAtFirstTarget);
         print('Camera X compensation: ' + cameraXOffsetMm.toFixed(3) + ' mm');
         print('Camera Y compensation: +' + cameraYOffsetMm.toFixed(3) + ' mm');
@@ -4002,7 +7084,7 @@ with (imports) {
             scanId,
             frameIndex,
             totalFrames,
-            interactivePickFile.exists()
+            reviewTargetsBeforePick
                 ? 'Scan started with interactive pick review enabled'
                 : touchDryRunFile.exists()
                 ? 'Scan started with touch dry run enabled'
@@ -4016,94 +7098,137 @@ with (imports) {
             message: 'New scan is running; no current detection preview yet',
             updated_at: new Date().toISOString()
         }, null, 2) + '\n');
-        launchSegmentation(scanDir, controlDir);
+        var segmentationProcess = launchSegmentation(scanDir, controlDir);
 
         var cameraLocation = camera.getLocation();
         var unitsPerPixel = getUnitsPerPixelForCurrentZ(camera);
-        var firstCommandedX = calibration.scanBoundsAreCameraCoordinates ? xs[0] : xs[0] + cameraXOffsetMm;
-        var firstCommandedY = calibration.scanBoundsAreCameraCoordinates ? ys[0] : ys[0] + cameraYOffsetMm;
+        var firstTray = activeScanTrays[0];
+        var firstXs = positions(
+            Math.min(firstTray.xLeft, firstTray.xRight),
+            Math.max(firstTray.xLeft, firstTray.xRight),
+            xStepMm,
+            false
+        );
+        var firstYs = positions(
+            Math.min(firstTray.yTop, firstTray.yBottom),
+            Math.max(firstTray.yTop, firstTray.yBottom),
+            yStepMm,
+            false
+        );
+        var firstCommandedX = calibration.scanBoundsAreCameraCoordinates ? firstXs[0] : firstXs[0] + cameraXOffsetMm;
+        var firstCommandedY = calibration.scanBoundsAreCameraCoordinates ? firstYs[0] : firstYs[0] + cameraYOffsetMm;
         print('Top camera location at scan start: ' + formatLocation(cameraLocation));
-        print('First requested scan coordinate is X=' + xs[0].toFixed(3) + ' Y=' + ys[0].toFixed(3));
+        print('First requested scan coordinate is tray ' + firstTray.traySlot
+            + ' X=' + firstXs[0].toFixed(3) + ' Y=' + firstYs[0].toFixed(3));
         print('First commanded camera target will be X=' + firstCommandedX.toFixed(3)
             + ' Y=' + firstCommandedY.toFixed(3));
 
         var halted = false;
         try {
-            for (var row = 0; row < ys.length; row++) {
-                var leftToRight = (row % 2) === 0;
+            for (var trayScanIndex = 0; trayScanIndex < activeScanTrays.length; trayScanIndex++) {
+                var scanTray = activeScanTrays[trayScanIndex];
+                var trayXStart = Math.min(scanTray.xLeft, scanTray.xRight);
+                var trayXEnd = Math.max(scanTray.xLeft, scanTray.xRight);
+                var trayYStart = Math.min(scanTray.yTop, scanTray.yBottom);
+                var trayYEnd = Math.max(scanTray.yTop, scanTray.yBottom);
+                var xs = positions(trayXStart, trayXEnd, xStepMm, false);
+                var ys = positions(trayYStart, trayYEnd, yStepMm, false);
+                var currentScanContext = {
+                    sorting_tray_slot: scanTray.traySlot,
+                    collection_event_slot: scanTray.collectionEventSlot,
+                    plate_slot: scanTray.plateSlot,
+                    recovery_slot: scanTray.recoverySlot,
+                    tray_height_mm: scanTray.trayHeightMm,
+                    tray_pick_z_mm: scanTray.pickZMm,
+                    tray_size_class: scanTray.sizeClass
+                };
+                print('Scanning sorting tray ' + scanTray.traySlot
+                    + ' for event ' + scanTray.collectionEventSlot
+                    + ': X=' + trayXStart.toFixed(3) + '..' + trayXEnd.toFixed(3)
+                    + ' Y=' + trayYStart.toFixed(3) + '..' + trayYEnd.toFixed(3)
+                    + ' grid=' + xs.length + 'x' + ys.length
+                    + ' pickZ=' + scanTray.pickZMm.toFixed(3));
+                for (var row = 0; row < ys.length; row++) {
+                    var leftToRight = (row % 2) === 0;
 
-                for (var col = 0; col < xs.length; col++) {
-                    if (!waitWhilePaused(pauseFile, stopFile, statusFile, scanId, frameIndex, totalFrames)
-                            || haltRequested(stopFile, statusFile, scanId, frameIndex, totalFrames)) {
-                        halted = true;
-                        return;
+                    for (var col = 0; col < xs.length; col++) {
+                        if (!waitWhilePaused(pauseFile, stopFile, statusFile, scanId, frameIndex, totalFrames)
+                                || haltRequested(stopFile, statusFile, scanId, frameIndex, totalFrames)) {
+                            halted = true;
+                            return;
+                        }
+
+                        var scanX = leftToRight ? xs[col] : xs[xs.length - 1 - col];
+                        var scanY = ys[row];
+                        var x = calibration.scanBoundsAreCameraCoordinates ? scanX : scanX + cameraXOffsetMm;
+                        var y = calibration.scanBoundsAreCameraCoordinates ? scanY : scanY + cameraYOffsetMm;
+                        var requestedX = calibration.scanBoundsAreCameraCoordinates ? scanX - cameraXOffsetMm : scanX;
+                        var requestedY = calibration.scanBoundsAreCameraCoordinates ? scanY - cameraYOffsetMm : scanY;
+                        var currentCameraLocation = camera.getLocation();
+                        var location = currentCameraLocation.add(new Location(
+                            LengthUnit.Millimeters,
+                            x - currentCameraLocation.x,
+                            y - currentCameraLocation.y,
+                            0,
+                            0
+                        ));
+
+                        print('Moving Top camera to frame ' + frameIndex
+                            + ' tray ' + scanTray.traySlot
+                            + ' target X=' + x.toFixed(3)
+                            + ' Y=' + y.toFixed(3)
+                            + ' requested X=' + requestedX.toFixed(3)
+                            + ' Y=' + requestedY.toFixed(3));
+                        camera.moveTo(location);
+                        print('Top camera after move: ' + formatLocation(camera.getLocation()));
+                        var image = camera.settleAndCapture();
+                        var fileName = 'frame_' + pad(frameIndex, 5)
+                            + '_' + timestamp()
+                            + '_x' + x.toFixed(2)
+                            + '_y' + y.toFixed(2)
+                            + '.png';
+                        var imageFile = new File(framesDir, fileName);
+
+                        ImageIO.write(image, 'PNG', imageFile);
+                        manifest.write(jsonLine(
+                            frameIndex,
+                            'frames/' + fileName,
+                            x,
+                            y,
+                            requestedX,
+                            requestedY,
+                            image.getWidth(),
+                            image.getHeight(),
+                            unitsPerPixel,
+                            currentScanContext
+                        ));
+                        manifest.flush();
+
+                        print('Captured ' + fileName);
+                        frameIndex++;
+                        writeStatus(statusFile, 'running', scanId, frameIndex, totalFrames, 'Captured ' + fileName);
+
+                        if (stopAtFirstTarget && waitForTargetCount(scanDir, 1, 2500)) {
+                            stopAfterFirstTarget = true;
+                            print('First target detected after frame ' + (frameIndex - 1)
+                                + '. Stopping scan early for touch dry-run diagnosis.');
+                            writeStatus(
+                                statusFile,
+                                'scan_complete',
+                                scanId,
+                                frameIndex,
+                                frameIndex,
+                                'First target detected; stopping scan early for touch dry run'
+                            );
+                            break;
+                        }
+
                     }
 
-                    var scanX = leftToRight ? xs[col] : xs[xs.length - 1 - col];
-                    var scanY = ys[row];
-                    var x = calibration.scanBoundsAreCameraCoordinates ? scanX : scanX + cameraXOffsetMm;
-                    var y = calibration.scanBoundsAreCameraCoordinates ? scanY : scanY + cameraYOffsetMm;
-                    var requestedX = calibration.scanBoundsAreCameraCoordinates ? scanX - cameraXOffsetMm : scanX;
-                    var requestedY = calibration.scanBoundsAreCameraCoordinates ? scanY - cameraYOffsetMm : scanY;
-                    var currentCameraLocation = camera.getLocation();
-                    var location = currentCameraLocation.add(new Location(
-                        LengthUnit.Millimeters,
-                        x - currentCameraLocation.x,
-                        y - currentCameraLocation.y,
-                        0,
-                        0
-                    ));
-
-                    print('Moving Top camera to frame ' + frameIndex
-                        + ' target X=' + x.toFixed(3)
-                        + ' Y=' + y.toFixed(3)
-                        + ' requested X=' + requestedX.toFixed(3)
-                        + ' Y=' + requestedY.toFixed(3));
-                    camera.moveTo(location);
-                    print('Top camera after move: ' + formatLocation(camera.getLocation()));
-                    var image = camera.settleAndCapture();
-                    var fileName = 'frame_' + pad(frameIndex, 5)
-                        + '_' + timestamp()
-                        + '_x' + x.toFixed(2)
-                        + '_y' + y.toFixed(2)
-                        + '.png';
-                    var imageFile = new File(framesDir, fileName);
-
-                    ImageIO.write(image, 'PNG', imageFile);
-                    manifest.write(jsonLine(
-                        frameIndex,
-                        'frames/' + fileName,
-                        x,
-                        y,
-                        requestedX,
-                        requestedY,
-                        image.getWidth(),
-                        image.getHeight(),
-                        unitsPerPixel
-                    ));
-                    manifest.flush();
-
-                    print('Captured ' + fileName);
-                    frameIndex++;
-                    writeStatus(statusFile, 'running', scanId, frameIndex, totalFrames, 'Captured ' + fileName);
-
-                    if (stopAtFirstTarget && waitForTargetCount(scanDir, 1, 2500)) {
-                        stopAfterFirstTarget = true;
-                        print('First target detected after frame ' + (frameIndex - 1)
-                            + '. Stopping scan early for touch dry-run diagnosis.');
-                        writeStatus(
-                            statusFile,
-                            'scan_complete',
-                            scanId,
-                            frameIndex,
-                            frameIndex,
-                            'First target detected; stopping scan early for touch dry run'
-                        );
+                    if (stopAfterFirstTarget) {
                         break;
                     }
-
                 }
-
                 if (stopAfterFirstTarget) {
                     break;
                 }
@@ -4118,15 +7243,33 @@ with (imports) {
                 writeStatus(statusFile, 'scan_complete', scanId, frameIndex, totalFrames, 'Scan completed; waiting for target segmentation');
                 print('Completed Top camera scan: ' + scanDir.getAbsolutePath());
             }
-            if (waitForSegmentation(scanDir, 120000)) {
+            if (waitForSegmentation(
+                    scanDir,
+                    120000,
+                    stopFile,
+                    statusFile,
+                    scanId,
+                    frameIndex,
+                    totalFrames,
+                    segmentationProcess,
+                    controlDir
+            )) {
                 var emptyWells = [];
+                var pickResult = null;
                 var pickSequenceRan = false;
-                if (interactivePickFile.exists()) {
+                if (reviewTargetsBeforePick) {
                     print('Segmentation complete. Showing numbered detection summary.');
                     if (showDetectionSummaryAndConfirm(scanDir, statusFile, scanId, totalFrames)) {
                         print('Starting left nozzle N1 pick/drop sequence after summary confirmation.');
                         pickSequenceRan = true;
-                        emptyWells = pickAndDropTargets(scanDir, pauseFile, stopFile, statusFile, scanId, totalFrames, plateContext, pendingWellQueue);
+                        if (plateContexts.length > 1) {
+                            pickResult = pickAndDropPlateContexts(scanDir, pauseFile, stopFile, statusFile, scanId, totalFrames, plateContexts);
+                            emptyWells = [];
+                        }
+                        else {
+                            pickResult = pickAndDropTargets(scanDir, pauseFile, stopFile, statusFile, scanId, totalFrames, plateContext, pendingWellQueue);
+                            emptyWells = pickResult.emptyWells;
+                        }
                     }
                 }
                 else if (touchDryRunFile.exists()) {
@@ -4136,31 +7279,149 @@ with (imports) {
                 else {
                     print('Segmentation complete. Starting left nozzle N1 pick/drop sequence.');
                     pickSequenceRan = true;
-                    emptyWells = pickAndDropTargets(scanDir, pauseFile, stopFile, statusFile, scanId, totalFrames, plateContext, pendingWellQueue);
+                    if (plateContexts.length > 1) {
+                        pickResult = pickAndDropPlateContexts(scanDir, pauseFile, stopFile, statusFile, scanId, totalFrames, plateContexts);
+                        emptyWells = [];
+                    }
+                    else {
+                        pickResult = pickAndDropTargets(scanDir, pauseFile, stopFile, statusFile, scanId, totalFrames, plateContext, pendingWellQueue);
+                        emptyWells = pickResult.emptyWells;
+                    }
                 }
 
                 if (emptyWells.length > 0 && pickSequenceRan && !touchDryRunFile.exists()) {
-                    var refillWells = promptRetryEmptyWells(emptyWells);
-                    if (refillWells.length > 0) {
-                        pendingWellQueue = [];
-                        for (var emptyIndex = 0; emptyIndex < refillWells.length; emptyIndex++) {
-                            pendingWellQueue.push(Number(refillWells[emptyIndex].index));
+                    var refillChoice = promptRetryEmptyWells(
+                        emptyWells,
+                        pickResult === null ? 0 : pickResult.remainingTargets
+                    );
+                    recordManuallyConfirmedOccupiedWells(scanDir, plateContext, refillChoice.occupiedWells);
+                    var refillWells = refillChoice.wells;
+                    if (refillChoice.mode === 'manual_occupied_only') {
+                        emptyWells = [];
+                    }
+                    if (refillWells.length > 0 && refillChoice.mode === 'continue_previous_scan') {
+                        var sameScanTargetIndex = pickResult.nextTargetIndex;
+                        pendingWellQueue = refillThenRemainingWellQueue(plateContext, refillWells, emptyWells);
+                        print('User requested same-scan refill; using remaining targets starting at target '
+                            + (sameScanTargetIndex + 1) + ' for wells: '
+                            + pendingWellQueue.map(function(wellIndex) {
+                            return wellNameForIndex(Number(wellIndex));
+                        }).join(', '));
+                        var rescanRequestedAfterSameScan = false;
+                        while (pendingWellQueue.length > 0 && sameScanTargetIndex < pickResult.targetsFound) {
+                            var sameScanPickResult = pickAndDropTargets(
+                                scanDir,
+                                pauseFile,
+                                stopFile,
+                                statusFile,
+                                scanId,
+                                totalFrames,
+                                plateContext,
+                                pendingWellQueue,
+                                sameScanTargetIndex
+                            );
+                            sameScanTargetIndex = sameScanPickResult.nextTargetIndex;
+                            emptyWells = sameScanPickResult.emptyWells;
+                            pickResult = sameScanPickResult;
+                            if (emptyWells.length === 0) {
+                                break;
+                            }
+                            refillChoice = promptRetryEmptyWells(emptyWells, pickResult.remainingTargets);
+                            recordManuallyConfirmedOccupiedWells(scanDir, plateContext, refillChoice.occupiedWells);
+                            refillWells = refillChoice.wells;
+                            if (refillChoice.mode === 'manual_occupied_only') {
+                                emptyWells = [];
+                                break;
+                            }
+                            if (refillWells.length === 0) {
+                                break;
+                            }
+                            if (refillChoice.mode === 'rescan') {
+                                pendingWellQueue = refillThenRemainingWellQueue(plateContext, refillWells, emptyWells);
+                                refillAttempt++;
+                                print('User switched from same-scan refill to rescan; next queue is: '
+                                    + pendingWellQueue.map(function(wellIndex) {
+                                    return wellNameForIndex(Number(wellIndex));
+                                }).join(', '));
+                                rescanRequestedAfterSameScan = true;
+                                break;
+                            }
+                            pendingWellQueue = refillThenRemainingWellQueue(plateContext, refillWells, emptyWells);
+                            print('Continuing same-scan refill from target ' + (sameScanTargetIndex + 1)
+                                + ' for wells: ' + pendingWellQueue.map(function(wellIndex) {
+                                return wellNameForIndex(Number(wellIndex));
+                            }).join(', '));
                         }
+                        if (pendingWellQueue.length > 0
+                                && rescanRequestedAfterSameScan) {
+                            continue;
+                        }
+                    }
+                    else if (refillWells.length > 0 && refillChoice.mode === 'rescan') {
+                        pendingWellQueue = refillThenRemainingWellQueue(plateContext, refillWells, emptyWells);
                         refillAttempt++;
-                        print('User requested refill attempt for wells: ' + pendingWellQueue.map(function(wellIndex) {
+                        print('User requested refill attempt; next queue is missed wells first, then remaining open wells: '
+                            + pendingWellQueue.map(function(wellIndex) {
                             return wellNameForIndex(Number(wellIndex));
                         }).join(', '));
                         continue;
                     }
                 }
                 pendingWellQueue = [];
-                if (emptyWells.length === 0 && pickSequenceRan && !touchDryRunFile.exists()) {
+                if (pickSequenceRan
+                        && pickResult !== null
+                        && pickResult.attemptedWells === 0
+                        && pickResult.targetsFound === 0
+                        && !touchDryRunFile.exists()) {
                     JOptionPane.showMessageDialog(
                         null,
-                        'All attempted wells were confirmed occupied for plate ' + plateContext.plateNumber + '.',
-                        'Plate run complete',
+                        'No pick targets were found after segmentation, so no wells were attempted for plate '
+                            + plateContext.plateNumber + '.',
+                        'No pick targets',
                         JOptionPane.INFORMATION_MESSAGE
                     );
+                }
+                if (emptyWells.length === 0
+                        && pickSequenceRan
+                        && pickResult !== null
+                        && pickResult.attemptedWells > 0
+                        && !touchDryRunFile.exists()) {
+                    var completedAuditMessages = [];
+                    for (var auditIndex = 0; auditIndex < plateContexts.length; auditIndex++) {
+                        var auditContext = plateContexts[auditIndex];
+                        if (isPlateCompletelyFilled(auditContext.plateNumber)) {
+                            var auditReport = runCompletedPlateAudit(auditContext, scanId);
+                            completedAuditMessages.push(
+                                auditContext.plateNumber + ': '
+                                    + (auditReport.passed ? 'audit passed' : 'audit needs review')
+                            );
+                        }
+                    }
+                    if (plateContexts.length > 1) {
+                        JOptionPane.showMessageDialog(
+                            null,
+                            'Multi-plate run complete. Refill prompting is still single-plate only, so review both CSV files and wells before the next test.'
+                                + (completedAuditMessages.length > 0
+                                    ? '\n\nCompleted plate audit: ' + completedAuditMessages.join('; ')
+                                    : ''),
+                            'Multi-plate run complete',
+                            JOptionPane.INFORMATION_MESSAGE
+                        );
+                    }
+                    else {
+                        JOptionPane.showMessageDialog(
+                            null,
+                            'All attempted wells were confirmed occupied for plate ' + plateContext.plateNumber + '.'
+                                + (completedAuditMessages.length > 0
+                                    ? '\n\nCompleted plate audit: ' + completedAuditMessages.join('; ')
+                                    : ''),
+                            'Plate run complete',
+                            JOptionPane.INFORMATION_MESSAGE
+                        );
+                    }
+                }
+                if (pickSequenceRan && pickResult !== null && !touchDryRunFile.exists()) {
+                    writeStatus(statusFile, 'completed', scanId, totalFrames, totalFrames, 'Scan and pick/drop sequence completed');
                 }
             }
         }

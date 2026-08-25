@@ -59,8 +59,8 @@ except ModuleNotFoundError as exc:
 
 
 MIN_AREA_PX = 80
-MAX_AREA_FRACTION = 0.03
-MAX_RECT_AREA_FRACTION = 0.02
+MAX_AREA_FRACTION = 0.055
+MAX_RECT_AREA_FRACTION = 0.08
 MAX_SHORT_SIDE_FRACTION = 0.12
 MAX_LONG_SIDE_FRACTION = 0.18
 MIN_RECTANGULARITY = 0.02
@@ -88,6 +88,8 @@ PINK_RED_DOMINANCE = 12
 PINK_MIN_HUE = 135
 BUG_MIN_FILL_RATIO = 0.04
 IMAGE_EDGE_REJECT_MARGIN_PX = 40
+IMAGE_EDGE_KEEP_MIN_AREA_PX = 22000
+IMAGE_EDGE_KEEP_MIN_SHORT_SIDE_PX = 90
 COLOR_PRESENT_SATURATION_P99 = 20
 COLOR_MIN_AREA_PX = 1500
 COLOR_MAX_AXIS_ASPECT_RATIO = 3.5
@@ -98,14 +100,25 @@ COLOR_MAX_LONG_SIDE_FRACTION = 0.48
 COLOR_MIN_BACKGROUND_CONTRAST = -15
 COLOR_MIN_USEFUL_CONTRAST = 8
 COLOR_MAX_LOW_CONTRAST_MEAN_INTENSITY = 140
-BUG_OUTLINE_MIN_AREA_PX = 3000
+BUG_OUTLINE_MIN_AREA_PX = 8000
 BUG_OUTLINE_MAX_INSIDE_MEAN_INTENSITY = 170
 BUG_OUTLINE_MIN_ABS_CONTRAST = 10
-BUG_BRIGHT_MIN_AREA_PX = 1500
+BUG_DARK_MIN_AREA_PX = 8000
+BUG_BRIGHT_MIN_AREA_PX = 8000
 BUG_BRIGHT_RESIDUAL_THRESHOLD = 13
 BUG_BRIGHT_MIN_ABS_CONTRAST = 12
-BUG_BODY_COLOR_MIN_AREA_PX = 1200
+BUG_BODY_COLOR_MIN_AREA_PX = 8000
 BUG_BODY_COLOR_MIN_ABS_CONTRAST = 7
+BUG_PALE_BODY_MIN_AREA_PX = 8000
+BUG_PALE_BODY_MIN_ABS_CONTRAST = 6
+BUG_EDGE_ARTIFACT_MIN_ABS_CONTRAST = 18
+BUG_DARK_SHADOW_MIN_ABS_CONTRAST = 3
+FRAGMENT_RECENTER_MAX_AREA_PX = 18000
+FRAGMENT_RECENTER_MAX_SCORE = 400000
+FRAGMENT_RECENTER_MIN_BODY_AREA_PX = 4500
+FRAGMENT_RECENTER_MIN_AREA_RATIO = 2.2
+FRAGMENT_RECENTER_MAX_DISTANCE_PX = 240
+FRAGMENT_RECENTER_BBOX_PADDING_PX = 140
 GLOBAL_DEDUPE_DISTANCE_MM = 3.0
 CONTEXT_PADDING_PX = 900
 COORDINATE_TRANSFORM_VERSION = "image_y_inverted_v2"
@@ -124,6 +137,7 @@ EDGE_CANNY_HIGH = 55
 BOUNDING_BOX_COLOR = (0, 255, 0)
 DUPLICATE_BOX_COLOR = (0, 165, 255)
 CENTROID_COLOR = (0, 0, 255)
+RAW_CENTROID_COLOR = (0, 255, 255)
 LABEL_COLOR = (255, 255, 255)
 LABEL_BACKGROUND_COLOR = (0, 128, 0)
 DUPLICATE_LABEL_BACKGROUND_COLOR = (0, 100, 220)
@@ -134,8 +148,8 @@ DETECTION_STATUS_FILE = CONTROL_DIR / "detection_status.json"
 DETECTION_PREVIEW_FILE = CONTROL_DIR / "latest_detection_overlay.png"
 TRAINING_TRAY_CALIBRATION_FILE = SCRIPTS_DIR / "training_tray_calibration.json"
 CONTROL_TRAINING_TRAY_CALIBRATION_FILE = CONTROL_DIR / "training_tray_calibration.json"
-PREVIEW_MAX_WIDTH = 520
-PREVIEW_MAX_HEIGHT = 293
+PREVIEW_MAX_WIDTH = 1040
+PREVIEW_MAX_HEIGHT = 586
 
 DEFAULT_TRAINING_TRAY_CALIBRATION: dict[str, float] = {
     "x_left_mm": 361.0,
@@ -232,6 +246,10 @@ def normalize_manifest_frame(frame: dict[str, Any], calibration: dict[str, Any])
     normalized["training_tray_y_bottom_mm"] = calibration["y_bottom_mm"]
     normalized["training_camera_x_offset_mm"] = camera_x_offset
     normalized["training_camera_y_offset_mm"] = camera_y_offset
+    normalized["sorting_tray_slot"] = int(normalized.get("sorting_tray_slot", 1) or 1)
+    normalized["collection_event_slot"] = int(normalized.get("collection_event_slot", 1) or 1)
+    normalized["plate_slot"] = int(normalized.get("plate_slot", 1) or 1)
+    normalized["recovery_slot"] = int(normalized.get("recovery_slot", 1) or 1)
     return normalized
 
 
@@ -388,6 +406,30 @@ def make_body_color_mask(image: np.ndarray) -> np.ndarray:
     return mask
 
 
+def make_pale_body_mask(image: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    local_background = cv2.GaussianBlur(gray, (0, 0), 45)
+    warm_pale_body = ((hue < 35) | (hue > 145)) & (saturation > 8) & (value < 245)
+    locally_visible = gray < (local_background + 8)
+    mask = (warm_pale_body & locally_visible & (gray < 245)).astype(np.uint8) * 255
+    mask = cv2.bitwise_and(mask, cv2.bitwise_not(make_pink_mask(image)))
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+    )
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (31, 31)),
+    )
+    return mask
+
+
 def contour_contrast(gray: np.ndarray, contour: np.ndarray) -> tuple[float, float, float]:
     object_mask = np.zeros(gray.shape, dtype=np.uint8)
     cv2.drawContours(object_mask, [contour], -1, 255, -1)
@@ -456,9 +498,42 @@ def reject_image_edge_detections(
         y = detection["axis_bbox_y_px"]
         w = detection["axis_bbox_width_px"]
         h = detection["axis_bbox_height_px"]
-        if x <= margin_px or y <= margin_px:
+        touches_edge = (
+            x <= margin_px
+            or y <= margin_px
+            or x + w >= image_width - margin_px
+            or y + h >= image_height - margin_px
+        )
+        if touches_edge:
+            area = float(detection.get("area_px") or 0.0)
+            short_side = min(float(w), float(h))
+            if area < IMAGE_EDGE_KEEP_MIN_AREA_PX or short_side < IMAGE_EDGE_KEEP_MIN_SHORT_SIDE_PX:
+                continue
+            detection["edge_partial_detection"] = True
+        else:
+            detection["edge_partial_detection"] = False
+        if x <= 0 and x + w >= image_width:
             continue
-        if x + w >= image_width - margin_px or y + h >= image_height - margin_px:
+        if y <= 0 and y + h >= image_height:
+            continue
+        kept.append(detection)
+    return kept
+
+
+def reject_bug_shadow_artifacts(detections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    kept = []
+    for detection in detections:
+        method = str(detection.get("detection_method") or "")
+        abs_contrast = float(detection.get("absolute_background_contrast") or 0.0)
+        rectangularity = float(detection.get("rectangularity") or 0.0)
+        edge_partial = bool(detection.get("edge_partial_detection"))
+
+        if method in {"bug_body_color_mask", "bug_pale_body_mask"}:
+            if edge_partial and abs_contrast < BUG_EDGE_ARTIFACT_MIN_ABS_CONTRAST:
+                continue
+            if abs_contrast < 12.0 and rectangularity < 0.65:
+                continue
+        if method == "bug_dark_color_mask" and abs_contrast < BUG_DARK_SHADOW_MIN_ABS_CONTRAST:
             continue
         kept.append(detection)
     return kept
@@ -634,10 +709,7 @@ def detect_bugs(
     reference_side = min(gray.shape[0], gray.shape[1])
     saturation_p99 = float(np.percentile(cv2.cvtColor(image, cv2.COLOR_BGR2HSV)[:, :, 1], 99))
     color_present = saturation_p99 >= COLOR_PRESENT_SATURATION_P99
-    effective_min_area_px = max(min_area_px, COLOR_MIN_AREA_PX) if color_present else max(
-        min_area_px,
-        GRAYSCALE_MIN_AREA_PX,
-    )
+    effective_min_area_px = max(min_area_px, BUG_DARK_MIN_AREA_PX)
     effective_min_aspect_ratio = min_aspect_ratio if color_present else max(
         min_aspect_ratio,
         GRAYSCALE_MIN_AXIS_ASPECT_RATIO,
@@ -823,7 +895,33 @@ def detect_bugs(
     )
     body_color_detections = reject_image_edge_detections(body_color_detections, gray.shape)
 
-    return deduplicate_detections(detections + outline_detections + bright_detections + body_color_detections)
+    pale_body_detections = detect_rectangles_from_mask(
+        gray,
+        make_pale_body_mask(image),
+        method="bug_pale_body_mask",
+        min_area_px=BUG_PALE_BODY_MIN_AREA_PX,
+        max_area_fraction=max(max_area_fraction, 0.060),
+        max_rect_area_fraction=max(max_area_fraction, 0.160),
+        max_short_side_fraction=max(effective_max_short_side_fraction, 0.50),
+        max_long_side_fraction=max(effective_max_long_side_fraction, 0.70),
+        min_rectangularity=0.18,
+        min_aspect_ratio=0.80,
+        max_aspect_ratio=max(max_aspect_ratio, 6.0),
+        max_inside_mean_intensity=245,
+        min_background_contrast=-20,
+        min_abs_contrast=BUG_PALE_BODY_MIN_ABS_CONTRAST,
+        require_dark=False,
+    )
+    pale_body_detections = reject_image_edge_detections(pale_body_detections, gray.shape)
+
+    bug_detections = reject_bug_shadow_artifacts(
+        detections
+        + outline_detections
+        + bright_detections
+        + body_color_detections
+        + pale_body_detections
+    )
+    return deduplicate_detections(bug_detections)
 
 
 def image_point_to_machine_coordinates(
@@ -853,8 +951,102 @@ def object_machine_coordinates(frame: dict[str, Any], centroid_x_px: float, cent
     )
 
 
+def fragment_like_detection(detection: dict[str, Any]) -> bool:
+    area = float(detection.get("area_px") or detection.get("bbox_area_px") or 0.0)
+    score = float(detection.get("score") or 0.0)
+    aspect_ratio = float(detection.get("aspect_ratio") or 1.0)
+    method = str(detection.get("detection_method") or "")
+    weak_method = method in {
+        "bug_body_color_mask",
+        "bug_bright_mask",
+        "bug_pale_body_mask",
+        "bug_outline_mask",
+    }
+    small_or_weak = area <= FRAGMENT_RECENTER_MAX_AREA_PX or (
+        score <= FRAGMENT_RECENTER_MAX_SCORE and area <= FRAGMENT_RECENTER_MAX_AREA_PX * 1.5
+    )
+    narrow = aspect_ratio >= 1.45
+    return weak_method and small_or_weak and (narrow or area <= 3500.0)
+
+
+def recentered_pick_from_nearby_body(image: np.ndarray, detection: dict[str, Any]) -> tuple[float, float] | None:
+    if not fragment_like_detection(detection):
+        return None
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    saturation = hsv[:, :, 1].astype(np.float32)
+    value = hsv[:, :, 2]
+
+    dark_body = (gray < 150) | ((saturation > 45) & (value < 230))
+    body_mask = cv2.bitwise_or(make_body_color_mask(image), make_pale_body_mask(image))
+    body_mask = cv2.bitwise_or(body_mask, dark_body.astype(np.uint8) * 255)
+    body_mask = cv2.bitwise_and(body_mask, cv2.bitwise_not(make_pink_mask(image)))
+    body_mask = cv2.morphologyEx(
+        body_mask,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+    )
+    body_mask = cv2.morphologyEx(
+        body_mask,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (37, 37)),
+    )
+
+    component_count, labels, stats, centroids = cv2.connectedComponentsWithStats(body_mask, 8)
+    if component_count <= 1:
+        return None
+
+    detection_x = float(detection["centroid_x_px"])
+    detection_y = float(detection["centroid_y_px"])
+    detection_area = max(1.0, float(detection.get("area_px") or detection.get("bbox_area_px") or 1.0))
+    best_label = 0
+    best_score = 0.0
+
+    for label in range(1, component_count):
+        area = float(stats[label, cv2.CC_STAT_AREA])
+        if area < max(FRAGMENT_RECENTER_MIN_BODY_AREA_PX, detection_area * FRAGMENT_RECENTER_MIN_AREA_RATIO):
+            continue
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        w = int(stats[label, cv2.CC_STAT_WIDTH])
+        h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        if w < 45 or h < 45:
+            continue
+        if (
+            detection_x < x - FRAGMENT_RECENTER_BBOX_PADDING_PX
+            or detection_x > x + w + FRAGMENT_RECENTER_BBOX_PADDING_PX
+            or detection_y < y - FRAGMENT_RECENTER_BBOX_PADDING_PX
+            or detection_y > y + h + FRAGMENT_RECENTER_BBOX_PADDING_PX
+        ):
+            continue
+        component_x = float(centroids[label][0])
+        component_y = float(centroids[label][1])
+        distance_px = ((component_x - detection_x) ** 2 + (component_y - detection_y) ** 2) ** 0.5
+        if distance_px > FRAGMENT_RECENTER_MAX_DISTANCE_PX:
+            continue
+        score = area / (1.0 + distance_px * 0.02)
+        if score > best_score:
+            best_score = score
+            best_label = label
+
+    if not best_label:
+        return None
+
+    component_mask = (labels == best_label).astype(np.uint8)
+    weights = np.maximum(0, 190 - gray.astype(np.float32)) + (saturation * 0.8)
+    distance_to_edge = cv2.distanceTransform(component_mask, cv2.DIST_L2, 5)
+    body_strength = distance_to_edge * 8.0 + (weights * component_mask)
+    _, _, _, max_location = cv2.minMaxLoc(body_strength.astype(np.float32))
+    return float(max_location[0]), float(max_location[1])
+
+
 def body_biased_pick_point(image: np.ndarray, detection: dict[str, Any]) -> tuple[float, float]:
     """Choose a pick point near the insect body, not the wing-heavy silhouette center."""
+    recentered_pick = recentered_pick_from_nearby_body(image, detection)
+    if recentered_pick is not None:
+        return recentered_pick
+
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     saturation = hsv[:, :, 1].astype(np.float32)
@@ -968,6 +1160,68 @@ def detection_quality(record: dict[str, Any]) -> float:
     return float(record.get("score") or 0.0) + (float(record.get("bbox_area_px") or 0.0) * 80.0) - edge_penalty
 
 
+def median(values: list[float]) -> float:
+    sorted_values = sorted(values)
+    count = len(sorted_values)
+    if count == 0:
+        return 0.0
+    middle = count // 2
+    if count % 2:
+        return float(sorted_values[middle])
+    return float((sorted_values[middle - 1] + sorted_values[middle]) / 2.0)
+
+
+def apply_duplicate_group_pick_points(
+    unique: list[dict[str, Any]],
+    duplicate_pairs: list[tuple[dict[str, Any], dict[str, Any]]],
+) -> None:
+    groups: dict[int, list[dict[str, Any]]] = {id(record): [record] for record in unique}
+    for duplicate, kept in duplicate_pairs:
+        groups.setdefault(id(kept), [kept]).append(duplicate)
+
+    for kept in unique:
+        observations = groups.get(id(kept), [kept])
+        if len(observations) < 2:
+            continue
+
+        pick_x_values = [float(record["pick_x_mm"]) for record in observations]
+        pick_y_values = [float(record["pick_y_mm"]) for record in observations]
+        centroid_x_values = [float(record.get("centroid_x_mm", record["pick_x_mm"])) for record in observations]
+        centroid_y_values = [float(record.get("centroid_y_mm", record["pick_y_mm"])) for record in observations]
+        requested_pick_x_values = [
+            float(record.get("requested_frame_estimated_x_mm", record["pick_x_mm"]))
+            for record in observations
+        ]
+        requested_pick_y_values = [
+            float(record.get("requested_frame_estimated_y_mm", record["pick_y_mm"]))
+            for record in observations
+        ]
+
+        kept["single_frame_pick_x_mm"] = kept["pick_x_mm"]
+        kept["single_frame_pick_y_mm"] = kept["pick_y_mm"]
+        kept["single_frame_centroid_x_mm"] = kept.get("centroid_x_mm")
+        kept["single_frame_centroid_y_mm"] = kept.get("centroid_y_mm")
+        kept["duplicate_group_observation_count"] = len(observations)
+        kept["duplicate_group_object_indices"] = ",".join(
+            str(int(record.get("object_index", -1))) for record in observations
+        )
+        kept["pick_x_mm"] = median(pick_x_values)
+        kept["pick_y_mm"] = median(pick_y_values)
+        kept["estimated_x_mm"] = kept["pick_x_mm"]
+        kept["estimated_y_mm"] = kept["pick_y_mm"]
+        kept["centroid_x_mm"] = median(centroid_x_values)
+        kept["centroid_y_mm"] = median(centroid_y_values)
+        kept["requested_frame_estimated_x_mm"] = median(requested_pick_x_values)
+        kept["requested_frame_estimated_y_mm"] = median(requested_pick_y_values)
+        kept["requested_to_recorded_delta_x_mm"] = (
+            float(kept["requested_frame_estimated_x_mm"]) - float(kept["pick_x_mm"])
+        )
+        kept["requested_to_recorded_delta_y_mm"] = (
+            float(kept["requested_frame_estimated_y_mm"]) - float(kept["pick_y_mm"])
+        )
+        kept["coordinate_source_note"] = "duplicate_group_median_pick"
+
+
 def assign_duplicate_metadata(records: list[dict[str, Any]], minimum_distance_mm: float) -> list[dict[str, Any]]:
     unique: list[dict[str, Any]] = []
     duplicate_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -981,8 +1235,12 @@ def assign_duplicate_metadata(records: list[dict[str, Any]], minimum_distance_mm
         duplicate_of: dict[str, Any] | None = None
         duplicate_distance: float | None = None
         for kept in unique:
-            dx = float(record["pick_x_mm"]) - float(kept["pick_x_mm"])
-            dy = float(record["pick_y_mm"]) - float(kept["pick_y_mm"])
+            record_x = float(record.get("centroid_x_mm", record["pick_x_mm"]))
+            record_y = float(record.get("centroid_y_mm", record["pick_y_mm"]))
+            kept_x = float(kept.get("centroid_x_mm", kept["pick_x_mm"]))
+            kept_y = float(kept.get("centroid_y_mm", kept["pick_y_mm"]))
+            dx = record_x - kept_x
+            dy = record_y - kept_y
             distance = (dx * dx + dy * dy) ** 0.5
             if distance < minimum_distance_mm:
                 duplicate_of = kept
@@ -996,6 +1254,7 @@ def assign_duplicate_metadata(records: list[dict[str, Any]], minimum_distance_mm
             duplicate_pairs.append((record, duplicate_of))
 
     unique.sort(key=lambda item: (int(item["frame_index"]), int(item["object_index"])))
+    apply_duplicate_group_pick_points(unique, duplicate_pairs)
     for object_index, record in enumerate(unique):
         record["object_index"] = object_index
         record["is_duplicate"] = False
@@ -1007,21 +1266,26 @@ def assign_duplicate_metadata(records: list[dict[str, Any]], minimum_distance_mm
     return unique
 
 
-def mark_centroid(image: np.ndarray, center_x: float, center_y: float) -> None:
+def mark_centroid(
+    image: np.ndarray,
+    center_x: float,
+    center_y: float,
+    color: tuple[int, int, int] = CENTROID_COLOR,
+) -> None:
     x = int(round(center_x))
     y = int(round(center_y))
     cv2.line(
         image,
         (x - CENTROID_MARK_SIZE, y - CENTROID_MARK_SIZE),
         (x + CENTROID_MARK_SIZE, y + CENTROID_MARK_SIZE),
-        CENTROID_COLOR,
+        color,
         LINE_THICKNESS,
     )
     cv2.line(
         image,
         (x - CENTROID_MARK_SIZE, y + CENTROID_MARK_SIZE),
         (x + CENTROID_MARK_SIZE, y - CENTROID_MARK_SIZE),
-        CENTROID_COLOR,
+        color,
         LINE_THICKNESS,
     )
 
@@ -1064,7 +1328,13 @@ def draw_record(overlay: np.ndarray, record: dict[str, Any]) -> None:
     else:
         cv2.drawContours(overlay, [box], 0, BOUNDING_BOX_COLOR, LINE_THICKNESS)
         mark_label(overlay, "Target " + str(int(record["object_index"]) + 1), box)
-    mark_centroid(overlay, float(record["centroid_x_px"]), float(record["centroid_y_px"]))
+    centroid_x = float(record["centroid_x_px"])
+    centroid_y = float(record["centroid_y_px"])
+    pick_x = float(record.get("pick_centroid_x_px", centroid_x))
+    pick_y = float(record.get("pick_centroid_y_px", centroid_y))
+    if ((pick_x - centroid_x) ** 2 + (pick_y - centroid_y) ** 2) ** 0.5 > 8.0:
+        mark_centroid(overlay, centroid_x, centroid_y, RAW_CENTROID_COLOR)
+    mark_centroid(overlay, pick_x, pick_y)
 
 
 def draw_record_on_context(context: np.ndarray, record: dict[str, Any], context_padding: int) -> None:
@@ -1092,6 +1362,8 @@ def draw_record_on_context(context: np.ndarray, record: dict[str, Any], context_
 
     centroid_x = (float(record["centroid_x_px"]) - x0) * scale_x
     centroid_y = (float(record["centroid_y_px"]) - y0) * scale_y
+    pick_x = (float(record.get("pick_centroid_x_px", record["centroid_x_px"])) - x0) * scale_x
+    pick_y = (float(record.get("pick_centroid_y_px", record["centroid_y_px"])) - y0) * scale_y
 
     if bool(record.get("is_duplicate")):
         cv2.drawContours(context, [box], 0, DUPLICATE_BOX_COLOR, LINE_THICKNESS)
@@ -1099,7 +1371,9 @@ def draw_record_on_context(context: np.ndarray, record: dict[str, Any], context_
     else:
         cv2.drawContours(context, [box], 0, BOUNDING_BOX_COLOR, LINE_THICKNESS)
         mark_label(context, "Target " + str(int(record["object_index"]) + 1), box)
-    mark_centroid(context, centroid_x, centroid_y)
+    if ((pick_x - centroid_x) ** 2 + (pick_y - centroid_y) ** 2) ** 0.5 > 8.0:
+        mark_centroid(context, centroid_x, centroid_y, RAW_CENTROID_COLOR)
+    mark_centroid(context, pick_x, pick_y)
 
 
 def write_detection_preview(
@@ -1170,10 +1444,22 @@ def object_record(
     overlay_file: str,
 ) -> dict[str, Any]:
     pick_centroid_x, pick_centroid_y = body_biased_pick_point(image, detection)
+    centroid_machine_x, centroid_machine_y = object_machine_coordinates(
+        frame,
+        detection["centroid_x_px"],
+        detection["centroid_y_px"],
+    )
     machine_x, machine_y = object_machine_coordinates(
         frame,
         pick_centroid_x,
         pick_centroid_y,
+    )
+    requested_centroid_machine_x, requested_centroid_machine_y = image_point_to_machine_coordinates(
+        frame,
+        detection["centroid_x_px"],
+        detection["centroid_y_px"],
+        frame.get("requested_x_mm", frame["x_mm"]),
+        frame.get("requested_y_mm", frame["y_mm"]),
     )
     requested_machine_x, requested_machine_y = image_point_to_machine_coordinates(
         frame,
@@ -1198,6 +1484,13 @@ def object_record(
         "frame_y_mm": frame["y_mm"],
         "frame_requested_x_mm": frame.get("requested_x_mm"),
         "frame_requested_y_mm": frame.get("requested_y_mm"),
+        "sorting_tray_slot": frame.get("sorting_tray_slot", 1),
+        "collection_event_slot": frame.get("collection_event_slot", 1),
+        "plate_slot": frame.get("plate_slot", 1),
+        "recovery_slot": frame.get("recovery_slot", 1),
+        "tray_height_mm": frame.get("tray_height_mm"),
+        "tray_pick_z_mm": frame.get("tray_pick_z_mm"),
+        "tray_size_class": frame.get("tray_size_class"),
         "training_tray_calibration_source": frame.get("training_tray_calibration_source"),
         "training_tray_x_left_mm": frame.get("training_tray_x_left_mm"),
         "training_tray_x_right_mm": frame.get("training_tray_x_right_mm"),
@@ -1225,10 +1518,14 @@ def object_record(
         "centroid_y_px": detection["centroid_y_px"],
         "pick_centroid_x_px": pick_centroid_x,
         "pick_centroid_y_px": pick_centroid_y,
+        "centroid_x_mm": centroid_machine_x,
+        "centroid_y_mm": centroid_machine_y,
         "estimated_x_mm": machine_x,
         "estimated_y_mm": machine_y,
         "pick_x_mm": machine_x,
         "pick_y_mm": machine_y,
+        "requested_frame_centroid_x_mm": requested_centroid_machine_x,
+        "requested_frame_centroid_y_mm": requested_centroid_machine_y,
         "requested_frame_estimated_x_mm": requested_machine_x,
         "requested_frame_estimated_y_mm": requested_machine_y,
         "requested_to_recorded_delta_x_mm": requested_machine_x - machine_x,
@@ -1263,6 +1560,13 @@ def csv_fields() -> list[str]:
         "frame_y_mm",
         "frame_requested_x_mm",
         "frame_requested_y_mm",
+        "sorting_tray_slot",
+        "collection_event_slot",
+        "plate_slot",
+        "recovery_slot",
+        "tray_height_mm",
+        "tray_pick_z_mm",
+        "tray_size_class",
         "training_tray_calibration_source",
         "training_tray_x_left_mm",
         "training_tray_x_right_mm",
@@ -1290,14 +1594,25 @@ def csv_fields() -> list[str]:
         "centroid_y_px",
         "pick_centroid_x_px",
         "pick_centroid_y_px",
+        "centroid_x_mm",
+        "centroid_y_mm",
         "estimated_x_mm",
         "estimated_y_mm",
         "pick_x_mm",
         "pick_y_mm",
+        "requested_frame_centroid_x_mm",
+        "requested_frame_centroid_y_mm",
         "requested_frame_estimated_x_mm",
         "requested_frame_estimated_y_mm",
         "requested_to_recorded_delta_x_mm",
         "requested_to_recorded_delta_y_mm",
+        "single_frame_pick_x_mm",
+        "single_frame_pick_y_mm",
+        "single_frame_centroid_x_mm",
+        "single_frame_centroid_y_mm",
+        "duplicate_group_observation_count",
+        "duplicate_group_object_indices",
+        "coordinate_source_note",
         "rectangularity",
         "aspect_ratio",
         "mean_intensity",
@@ -1444,8 +1759,8 @@ def write_summary_image(scan_dir: Path, records: list[dict[str, Any]]) -> str | 
     if not records:
         return None
 
-    thumb_width = 360
-    thumb_height = 260
+    thumb_width = 520
+    thumb_height = 360
     sorted_records = sorted(
         records,
         key=lambda item: (

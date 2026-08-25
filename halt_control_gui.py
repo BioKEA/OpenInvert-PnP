@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tkinter as tk
 import time
 from datetime import datetime
@@ -21,16 +22,42 @@ PAUSE_FILE = CONTROL_DIR / "pause.flag"
 STOP_FILE = CONTROL_DIR / "stop.flag"
 STATUS_FILE = CONTROL_DIR / "scan_status.json"
 DETECTION_STATUS_FILE = CONTROL_DIR / "detection_status.json"
+GUI_LOCK_FILE = CONTROL_DIR / "halt_control_gui.lock"
 TERMINAL_SCAN_STATUSES = {"completed", "halted", "failed", "error"}
 AUTO_CLOSE_DELAY_MS = 1500
+DEFAULT_WINDOW_WIDTH = 1800
+DEFAULT_WINDOW_HEIGHT = 1340
+MIN_WINDOW_WIDTH = 1200
+MIN_WINDOW_HEIGHT = 960
+DETECTION_PREVIEW_MAX_WIDTH = 1720
+DETECTION_PREVIEW_MAX_HEIGHT = 1040
+
+
+def claim_single_instance() -> object | None:
+    CONTROL_DIR.mkdir(exist_ok=True)
+    lock_handle = GUI_LOCK_FILE.open("w")
+    try:
+        import fcntl
+
+        fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        lock_handle.close()
+        return None
+    lock_handle.write(str(os.getpid()))
+    lock_handle.flush()
+    return lock_handle
 
 
 class HaltControl(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("BioKEA Bug PnP Control")
-        self.geometry("580x720")
-        self.minsize(580, 560)
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        window_width = min(DEFAULT_WINDOW_WIDTH, max(MIN_WINDOW_WIDTH, screen_width - 80))
+        window_height = min(DEFAULT_WINDOW_HEIGHT, max(MIN_WINDOW_HEIGHT, screen_height - 80))
+        self.geometry(f"{window_width}x{window_height}")
+        self.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
 
         CONTROL_DIR.mkdir(exist_ok=True)
 
@@ -141,7 +168,7 @@ class HaltControl(tk.Tk):
             "Pause waits before the next scan move. Halt exits the running script before the next move. "
             "Use OpenPnP/controller/physical stop for immediate emergency stop."
         )
-        ttk.Label(outer, text=note, wraplength=500).pack(anchor="w", pady=(8, 0))
+        ttk.Label(outer, text=note, wraplength=900).pack(anchor="w", pady=(8, 0))
 
         detection_panel = ttk.Frame(outer, padding=10, style="Panel.TFrame")
         detection_panel.pack(fill="both", expand=True, pady=(8, 0))
@@ -151,7 +178,7 @@ class HaltControl(tk.Tk):
             detection_panel,
             textvariable=self.detection_detail_var,
             style="Small.TLabel",
-            wraplength=520,
+            wraplength=980,
         ).pack(anchor="w", pady=(4, 8))
         self.detection_image_label = ttk.Label(detection_panel, style="Panel.TLabel")
         self.detection_image_label.pack(anchor="center", fill="both", expand=True)
@@ -354,8 +381,8 @@ class HaltControl(tk.Tk):
         except tk.TclError:
             return
 
-        max_width = 520
-        max_height = 293
+        max_width = DETECTION_PREVIEW_MAX_WIDTH
+        max_height = DETECTION_PREVIEW_MAX_HEIGHT
         subsample = max(
             1,
             int((image.width() + max_width - 1) / max_width),
@@ -393,8 +420,12 @@ class HaltControl(tk.Tk):
 
 
 def main() -> int:
+    lock_handle = claim_single_instance()
+    if lock_handle is None:
+        return 0
     app = HaltControl()
     app.mainloop()
+    lock_handle.close()
     return 0
 
 

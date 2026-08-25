@@ -1,0 +1,22 @@
+BugPicker rollback archive before multi-tray / multi-plate refactor
+
+Created: 2026-07-31
+Archive: archives/BugPicker_pre_multitray_20260731_rollback.tar.gz
+
+This archive was created from the current BugPicker directory before starting the
+multi-tray / multi-plate update. It preserves the current modified working tree,
+including calibration files, helper scripts, training assets, and .git metadata.
+
+Current modified files at archive time:
+  00_Halt_Control.py
+  01_Scan_TopCamera_Rectangle.js
+  02_Segment_Scan_Objects.py
+  03_QA_Inspect_Image.py
+  halt_control_gui.py
+  training_tray_calibration.json
+
+To inspect:
+  tar -tzf archives/BugPicker_pre_multitray_20260731_rollback.tar.gz
+
+To restore manually, extract into a temporary directory first, then copy back the
+needed files.
