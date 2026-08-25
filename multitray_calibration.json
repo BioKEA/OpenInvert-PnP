@@ -1,9 +1,9 @@
 {
   "schema_version": 2,
-  "active_collection_event_count": 1,
-  "active_sorting_tray_count": 1,
-  "active_plate_count": 1,
-  "active_recovery_plate_count": 1,
+  "active_collection_event_count": 2,
+  "active_sorting_tray_count": 2,
+  "active_plate_count": 2,
+  "active_recovery_plate_count": 2,
   "shared": {
     "camera_x_offset_mm": -23,
     "camera_y_offset_mm": 64,
@@ -20,14 +20,14 @@
     {
       "event_slot": 1,
       "enabled": true,
-      "collection_code": "CIBI02159",
+      "collection_code": "CIBI02180",
       "plate_slot": 1,
       "recovery_slot": 1
     },
     {
       "event_slot": 2,
-      "enabled": false,
-      "collection_code": "CIBI02423",
+      "enabled": true,
+      "collection_code": "CIBI02180",
       "plate_slot": 2,
       "recovery_slot": 2
     }
@@ -47,8 +47,8 @@
     },
     {
       "tray_slot": 2,
-      "enabled": false,
-      "collection_event_slot": 1,
+      "enabled": true,
+      "collection_event_slot": 2,
       "x_left_mm": 326,
       "x_right_mm": 422,
       "y_top_mm": 149,
@@ -86,7 +86,7 @@
     {
       "plate_slot": 1,
       "enabled": true,
-      "plate_number": "AA0034",
+      "plate_number": "AA0035",
       "start_well": "A1",
       "plate_a1_x_mm": 127.7,
       "plate_a1_y_mm": 99,
@@ -95,8 +95,8 @@
     },
     {
       "plate_slot": 2,
-      "enabled": false,
-      "plate_number": "AA0031",
+      "enabled": true,
+      "plate_number": "AA0036",
       "start_well": "A1",
       "plate_a1_x_mm": 140.7,
       "plate_a1_y_mm": 295.7,
@@ -113,7 +113,7 @@
     },
     {
       "recovery_slot": 2,
-      "enabled": false,
+      "enabled": true,
       "recovery_plate_a1_x_mm": 40.2,
       "recovery_plate_a1_y_mm": 272.1
     }
