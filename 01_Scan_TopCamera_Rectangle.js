@@ -3576,6 +3576,50 @@ with (imports) {
         }
     }
 
+    function runPlateTaxonomyClassifier(plateContexts, controlDir) {
+        var taxonomyScript = new File(scriptsDir, '08_Classify_Plate_Taxonomy.py').getAbsolutePath();
+        var allSucceeded = true;
+
+        for (var taxonomyIndex = 0; taxonomyIndex < plateContexts.length; taxonomyIndex++) {
+            var taxonomyContext = plateContexts[taxonomyIndex];
+            var taxonomyPlate = normalizePlateNumber(taxonomyContext.plateNumber);
+            var stdoutLog = new File(controlDir, 'taxonomy_classifier_' + taxonomyPlate + '.out.log');
+            var stderrLog = new File(controlDir, 'taxonomy_classifier_' + taxonomyPlate + '.err.log');
+
+            try {
+                var builder = new Packages.java.lang.ProcessBuilder(
+                    python,
+                    taxonomyScript,
+                    '--openpnp-root',
+                    projectDir.getAbsolutePath(),
+                    '--plate',
+                    taxonomyPlate
+                );
+                builder.directory(projectDir);
+                builder.redirectOutput(stdoutLog);
+                builder.redirectError(stderrLog);
+                var process = builder.start();
+                var exitCode = process.waitFor();
+                if (exitCode === 0) {
+                    print('Taxonomy classification completed for plate ' + taxonomyPlate + '.');
+                }
+                else {
+                    allSucceeded = false;
+                    print('Taxonomy classifier exited with code ' + exitCode + ' for plate ' + taxonomyPlate
+                        + '. Plate data is preserved and the run will continue.');
+                    print('See: ' + stderrLog.getAbsolutePath());
+                }
+            }
+            catch (error) {
+                allSucceeded = false;
+                print('Failed to run taxonomy classifier for plate ' + taxonomyPlate + ': ' + error);
+                print('See: ' + stderrLog.getAbsolutePath());
+            }
+        }
+
+        return allSucceeded;
+    }
+
     function touchTargets(scanDir, pauseFile, stopFile, statusFile, scanId, totalFrames) {
         var touchHeadName = 'H1';
         var touchNozzleName = 'N1';
@@ -7386,6 +7430,8 @@ with (imports) {
                         && pickResult !== null
                         && pickResult.attemptedWells > 0
                         && !touchDryRunFile.exists()) {
+                    writeStatus(statusFile, 'classifying', scanId, totalFrames, totalFrames, 'Running BioCLIP taxonomy classification');
+                    runPlateTaxonomyClassifier(plateContexts, controlDir);
                     var completedAuditMessages = [];
                     for (var auditIndex = 0; auditIndex < plateContexts.length; auditIndex++) {
                         var auditContext = plateContexts[auditIndex];
